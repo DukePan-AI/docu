@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="public/anything.png" alt="Anything" width="80" />
+  <img src="public/anything.png" alt="Finder" width="80" />
 </p>
 
-<h1 align="center">Anything</h1>
+<h1 align="center">Finder</h1>
 
 <p align="center">
   <b>내 PC 문서를 통째로 뒤지는 100% 로컬 검색 엔진</b><br/>
@@ -11,19 +11,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/chrisryugj/Docufinder/releases"><img src="https://img.shields.io/badge/Windows-x64-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" /></a>
+  <a href="https://github.com/DukePan-AI/docu/releases"><img src="https://img.shields.io/badge/Windows-x64-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" /></a>
   &nbsp;
-  <a href="https://github.com/chrisryugj/Docufinder/releases"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" /></a>
+  <a href="https://github.com/DukePan-AI/docu/releases"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" /></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/chrisryugj/Docufinder/releases"><img src="https://img.shields.io/badge/version-3.5.0-blue.svg" alt="Version" /></a>
+  <a href="https://github.com/DukePan-AI/docu/releases"><img src="https://img.shields.io/badge/version-3.8.1-blue.svg" alt="Version" /></a>
   <a href="https://tauri.app"><img src="https://img.shields.io/badge/Tauri-2.10-24C8D8.svg" alt="Tauri 2" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSL%201.1-blue.svg" alt="License" /></a>
 </p>
 
 <p align="center">
-  <a href="https://youtu.be/xuCGvqG6_SE"><img src="docs/video-demo.jpg" alt="Anything(문서내용검색) 활용하기 — 영상 보기" width="820" /></a>
+  <a href="https://youtu.be/xuCGvqG6_SE"><img src="docs/video-demo.jpg" alt="Finder(문서내용검색) 활용하기 — 영상 보기" width="820" /></a>
 </p>
 
 <p align="center">
@@ -81,12 +81,12 @@ Everything처럼 파일명 일부만 입력하면 인메모리 캐시에서 **�
 
 ### 다운로드 — 어느 파일을 받아야 하나?
 
-[Releases](https://github.com/chrisryugj/Docufinder/releases) 페이지에서 본인 환경에 맞게 받으세요.
+[Releases](https://github.com/DukePan-AI/docu/releases) 페이지에서 본인 환경에 맞게 받으세요.
 
 | 내 PC 상황 | 받을 파일 | 크기 |
 |------------|-----------|------|
-| 집 / 개인 PC, Windows 10 (21H2 이상) / Windows 11 | **`Anything_<버전>_x64-setup.exe`** 하나만 | ~365 MB |
-| 회사 PC인데 관리자 권한이 없거나, Windows 10 LTSC 같은 구버전, 또는 첫 실행 때 WebView2 오류가 떴던 분 | **`Anything_<버전>_x64-setup.exe`** + **`MicrosoftEdgeWebView2RuntimeInstallerX64.exe`** | ~365 MB + ~190 MB |
+| 집 / 개인 PC, Windows 10 (21H2 이상) / Windows 11 | **`Finder_<버전>_x64-setup.exe`** 하나만 | ~365 MB |
+| 회사 PC인데 관리자 권한이 없거나, Windows 10 LTSC 같은 구버전, 또는 첫 실행 때 WebView2 오류가 떴던 분 | **`Finder_<버전>_x64-setup.exe`** + **`MicrosoftEdgeWebView2RuntimeInstallerX64.exe`** | ~365 MB + ~190 MB |
 
 > **WebView2 런타임이 핵심입니다.** 이 앱은 Windows 의 Microsoft Edge WebView2 런타임 위에서 화면을 그립니다. 개인 PC 는 보통 이미 깔려 있어 setup 하나로 끝나지만, WebView2 가 없는 회사 PC / LTSC 환경에서는 `MicrosoftEdgeWebView2RuntimeInstallerX64.exe` 를 **먼저(가능하면 관리자 권한으로)** 설치한 뒤 앱 setup 을 실행하세요.
 
@@ -100,11 +100,11 @@ Everything처럼 파일명 일부만 입력하면 인메모리 캐시에서 **�
 > 과거의 통합본(`...-ltsc-setup.exe`, ~573MB)은 망간 전송에서 파일이 깨지거나 실행이 안 되는 문제로 폐기했습니다. 아래처럼 **두 파일을 나눠서** 옮기세요 (이슈 #29 제보자 검증 — 큰 단일 파일보다 전송 성공률이 높습니다).
 
 1. 인터넷 가능한 PC 에서 두 파일을 받기
-   - `Anything_<버전>_x64-setup.exe`
+  - `Finder_<버전>_x64-setup.exe`
    - `MicrosoftEdgeWebView2RuntimeInstallerX64.exe`
 2. 두 파일을 **각각** USB / 망간 전송으로 사내 PC 로 옮기기 (한 번에 하나씩)
 3. 사내 PC 에서 **`MicrosoftEdgeWebView2RuntimeInstallerX64.exe` 를 먼저 설치** (가능하면 관리자 권한)
-4. 이어서 `Anything_<버전>_x64-setup.exe` 더블클릭 — 끝
+4. 이어서 `Finder_<버전>_x64-setup.exe` 더블클릭 — 끝
    - WebView2 가 이미 있는 PC 라면 1번에서 앱 setup 하나만 옮겨도 됩니다.
 
 > **OCR 도 설치본만으로 동작합니다** (v3.4.3+). OCR 엔진·스캔 PDF 처리에 필요한 파일이 모두
@@ -137,44 +137,44 @@ Everything처럼 파일명 일부만 입력하면 인메모리 캐시에서 **�
 - 기업 PC는 IT 관리자 문의 (AppLocker 정책)
 
 **5. 설치 후 앱이 안 열릴 때**
-- `%APPDATA%\com.anything.app\crash.log` 내용과 함께 [Issues](https://github.com/chrisryugj/Docufinder/issues) 제보
+- `%APPDATA%\com.anything.app\crash.log` 내용과 함께 [Issues](https://github.com/DukePan-AI/docu/issues) 제보
 
 **6. "WebView2 런타임 오류" 가 떠서 앱이 안 열려요**
 - 다이얼로그에 *"You may have it installed on another user account..."* 같은 영문이 보이거나, "WebView2" 가 어쩌고 하는 오류로 시작 자체가 안 되는 경우.
 - **해결: `MicrosoftEdgeWebView2RuntimeInstallerX64.exe` 를 받아 (가능하면 관리자 권한으로) 설치한 뒤 앱을 다시 실행하세요.** 기존 앱은 제거하지 않아도 됩니다.
 - 인덱싱 / 폴더 설정 등 사용자 데이터는 그대로 보존됩니다.
-- 이래도 안 열리면 `%APPDATA%\com.anything.app\logs\` 안의 최신 로그 파일과 함께 [Issues](https://github.com/chrisryugj/Docufinder/issues) 로 제보해 주세요.
+- 이래도 안 열리면 `%APPDATA%\com.anything.app\logs\` 안의 최신 로그 파일과 함께 [Issues](https://github.com/DukePan-AI/docu/issues) 로 제보해 주세요.
 
 </details>
 
 ### macOS (Apple Silicon)
 
-[Releases](https://github.com/chrisryugj/Docufinder/releases) 페이지에서 `.dmg` 파일을 받아 실행.
+[Releases](https://github.com/DukePan-AI/docu/releases) 페이지에서 `.dmg` 파일을 받아 실행.
 
 - **macOS 11 (Big Sur) 이상** · Apple Silicon (M1/M2/M3) 전용
-- Intel Mac 미지원 (필요 시 [Issues](https://github.com/chrisryugj/Docufinder/issues)에 요청)
+- Intel Mac 미지원 (필요 시 [Issues](https://github.com/DukePan-AI/docu/issues)에 요청)
 - RAM 8GB 이상 권장 · 디스크 여유 1GB 이상
 - **자동 업데이트 미지원** — 새 버전은 수동 다운로드
 
 **설치 순서**
 1. `.dmg` 더블클릭 → Applications 폴더로 드래그
-2. **첫 실행만**: Applications 폴더에서 Anything 우클릭 → "열기" → 경고창에서 다시 "열기"
+2. **첫 실행만**: Applications 폴더에서 Finder 우클릭 → "열기" → 경고창에서 다시 "열기"
 
-**"Apple은 'Anything'에 악성 코드가 없음을 확인할 수 없습니다" 팝업이 뜰 때** (macOS 15 Sequoia 이상)
+**"Apple은 'Finder'에 악성 코드가 없음을 확인할 수 없습니다" 팝업이 뜰 때** (macOS 15 Sequoia 이상)
 
 macOS 15부터는 우클릭 → "열기" 우회가 막혀 위 팝업에 "열기" 버튼이 없습니다. 두 방법 중 하나로 열 수 있습니다.
 
-- 팝업에서 "완료" 클릭 → **시스템 설정 → 개인정보 보호 및 보안** → 하단 "'Anything'이(가) 차단되었습니다" 옆 **"그래도 열기"** → 다시 실행
+- 팝업에서 "완료" 클릭 → **시스템 설정 → 개인정보 보호 및 보안** → 하단 "'Finder'이(가) 차단되었습니다" 옆 **"그래도 열기"** → 다시 실행
 - 또는 터미널에서 quarantine 속성 제거:
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Anything.app
+xattr -dr com.apple.quarantine /Applications/Finder.app
 ```
 
 **"손상된 앱"으로 표시될 때** (Gatekeeper quarantine)
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Anything.app
+xattr -dr com.apple.quarantine /Applications/Finder.app
 ```
 
 > Apple Developer ID 인증서 미보유로 ad-hoc 서명만 적용되어 있습니다. 악성코드가 아니며 소스는 이 저장소에서 확인 가능합니다.
@@ -185,7 +185,7 @@ xattr -dr com.apple.quarantine /Applications/Anything.app
 
 1. 앱 실행 → 좌측 **"폴더 추가"** → 문서 폴더 선택 (자동 인덱싱 시작)
 2. 검색창에 입력 → 결과 클릭으로 미리보기, 더블클릭으로 파일 열기
-3. (선택) 검색바 모드를 'Anything'으로 바꿔 질문 → 문서 기반 AI 답변 (설정 → AI 탭에서 API 키 등록)
+3. (선택) 검색바 모드를 'Finder AI'로 바꿔 질문 → 문서 기반 AI 답변 (설정 → AI 탭에서 API 키 등록)
 
 ### 검색 모드
 
@@ -194,7 +194,7 @@ xattr -dr com.apple.quarantine /Applications/Anything.app
 | 키워드 | 기본값. 정확한 단어 매칭 + 아래 검색 연산자 |
 | 파일명 | Everything 스타일 파일명 즉시 검색 |
 | 스마트 (자연어) | "작년 예산 한글 문서"처럼 말로 조건 조합 — 검색바 토글 |
-| Anything (질문) | 문서를 근거로 AI가 답변, 출처 문서·페이지 표시 — 검색바 토글 |
+| Finder AI (질문) | 문서를 근거로 AI가 답변, 출처 문서·페이지 표시 — 검색바 토글 |
 
 > 설정에서 시맨틱(AI) 검색을 켜면 유사 문서 찾기·유사 중복 탐지와 AI 질의응답의 근거 검색에 의미(벡터) 검색이 활용됩니다.
 
@@ -332,4 +332,4 @@ Pretendard, kordoc 및 그 의존성)의 저작권·라이선스 고지는
 
 ---
 
-버그 리포트·기능 제안은 [Issues](https://github.com/chrisryugj/Docufinder/issues)에서 환영합니다.
+버그 리포트·기능 제안은 [Issues](https://github.com/DukePan-AI/docu/issues)에서 환영합니다.
