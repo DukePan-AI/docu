@@ -316,7 +316,7 @@ SSD 기준 약 1,000개 문서에 2~5분. FTS 인덱싱이 먼저 완료되어 �
 - 프로덕션/상용은 별도 라이선스 필요
 - 2030-04-15 이후 Apache License 2.0 자동 전환
 
-상용 라이선스 문의: ryuseungin@gmail.com
+상용 라이선스 문의: ckdgnssla12@gmail.com
 
 배포본에 포함되는 제3자 저작물(PDFium, ONNX Runtime, PaddleOCR, Node.js,
 Pretendard, kordoc 및 그 의존성)의 저작권·라이선스 고지는
