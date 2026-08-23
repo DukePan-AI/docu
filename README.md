@@ -22,13 +22,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSL%201.1-blue.svg" alt="License" /></a>
 </p>
 
-<p align="center">
-  <a href="https://youtu.be/xuCGvqG6_SE"><img src="docs/video-demo.jpg" alt="Finder(문서내용검색) 활용하기 — 영상 보기" width="820" /></a>
-</p>
-
-<p align="center">
-  <sub>▶ 클릭하면 유튜브에서 재생됩니다.</sub>
-</p>
 
 ---
 
