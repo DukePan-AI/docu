@@ -1,0 +1,106 @@
+import type { Theme } from "../hooks/useTheme";
+import type { SearchMode } from "./search";
+
+export type ViewDensity = "normal" | "compact";
+export type VectorIndexingMode = "manual" | "auto";
+export type IndexingIntensity = "fast" | "balanced" | "background";
+export type AiProvider = "gemini" | "open_ai";
+
+export interface Settings {
+  search_mode: SearchMode;
+  max_results: number;
+  chunk_size: number;
+  chunk_overlap: number;
+  theme: Theme;
+  min_confidence: number;
+  view_density: ViewDensity;
+  include_subfolders: boolean;
+  auto_start: boolean;
+  start_minimized: boolean;
+  /** X 버튼 클릭 시 트레이로 숨김 (false면 앱 종료) */
+  close_to_tray: boolean;
+  /** 파일명 하이라이트 색상 (hex) */
+  highlight_filename_color?: string;
+  /** 문서 내용 하이라이트 색상 (hex) */
+  highlight_content_color?: string;
+  /** 시맨틱 검색 활성화 여부 */
+  semantic_search_enabled: boolean;
+  /** 벡터 인덱싱 모드 */
+  vector_indexing_mode: VectorIndexingMode;
+  /** 인덱싱 강도 */
+  indexing_intensity: IndexingIntensity;
+  /** 단일 파일 최대 크기 (MB). 초과 시 스킵 */
+  max_file_size_mb: number;
+  /** 검색 결과 더 보기 단위 (한 번에 표시할 개수) */
+  results_per_page: number;
+  /** 데이터 저장 경로 (DB, 벡터 인덱스). 미설정 시 기본 AppData 사용 */
+  data_root?: string;
+  /** 사용자 커스텀 제외 디렉토리 목록 */
+  exclude_dirs?: string[];
+  /** AI 기능 활성화 */
+  ai_enabled: boolean;
+  /** LLM provider — Gemini(기본) / OpenAI 호환 endpoint */
+  ai_provider: AiProvider;
+  /**
+   * OpenAI 호환 endpoint base URL — `ai_provider === "open_ai"` 일 때만 사용.
+   * 예: `http://192.168.1.50:8000` (vLLM), `http://localhost:11434` (Ollama),
+   *     `https://api.together.xyz`. `/v1/chat/completions` 가 호출됨.
+   */
+  ai_base_url?: string;
+  /** API 키 (provider 공통) */
+  ai_api_key?: string;
+  /** AI 모델 ID */
+  ai_model: string;
+  /** AI 응답 온도 (0.0-2.0) */
+  ai_temperature: number;
+  /** AI 최대 토큰 수 */
+  ai_max_tokens: number;
+  /** OCR 기능 활성화 (이미지 파일 텍스트 인식) */
+  ocr_enabled: boolean;
+  /** 스캔/이미지 OCR 레이아웃 분석 (PP-DocLayout, 실험적, 기본 off) */
+  ocr_layout_enabled: boolean;
+  /** 검색 결과에서 같은 문서의 여러 버전을 대표 1개로 접기 (Document Lineage) */
+  group_versions: boolean;
+  /** 자동 동기화 주기 (분). 0 = 끄기, 기본 10분. watcher 이벤트 누락 보완. */
+  auto_sync_interval_minutes: number;
+  /** 오류 자동 리포트 (Telegram). 파일 경로는 익명화, 문서 내용은 전송하지 않음. */
+  error_reporting_enabled: boolean;
+  /**
+   * PDF 수식 OCR 활성화 (기본 false). 토글 켜면 첫 사용 시 ~155MB 모델 자동 다운로드.
+   * 인식된 수식은 `$...$` (inline) / `$$...$$` (display) 로 검색/미리보기에 반영.
+   */
+  formula_ocr_enabled: boolean;
+  /**
+   * 클라우드/네트워크 폴더(OneDrive·구글·NAVER Works·UNC·매핑 SMB 등)의 본문 인덱싱 자동 스킵.
+   * 기본 true: 메타데이터만 인덱싱(파일명 검색 가능), hydrate/다운로드 차단.
+   * false: 일반 로컬 폴더처럼 본문까지 인덱싱 (NAS 등 빠른 환경에서 사용자 선택).
+   */
+  skip_cloud_body_indexing: boolean;
+  /**
+   * 시스템 보호 폴더(C:\Windows, /System, /usr/bin 등) 수동 추가 허용.
+   * 기본 false: validate_watch_path가 차단.
+   * true: 사용자가 폴더 다이얼로그에서 직접 골라 추가 가능. 추가 시 강한 경고 다이얼로그.
+   * 시스템 폴더는 자동 벡터(시맨틱) 인덱싱 스킵 — 필요 시 설정에서 수동 시작.
+   */
+  allow_system_folders: boolean;
+  /**
+   * 검색 결과 한 번 클릭으로 파일 열기.
+   * false(기본): 두 번 클릭(또는 Enter)으로 열기, 한 번 클릭은 선택·미리보기.
+   * true: 한 번 클릭으로 즉시 열기 (v3.2.6 이전 동작).
+   */
+  open_on_single_click: boolean;
+  /** 검색 결과 카드에 저장 위치(폴더 경로) 표시. 컴팩트 보기에서도 표시된다. */
+  show_result_path: boolean;
+  /**
+   * 검색 결과 카드에 수정 날짜/시간을 절대값(YYYY. MM. DD. HH:MM)으로 상시 표시.
+   * false면 상대시간("3일 전")을 표시하고 절대 날짜/시간은 툴팁으로 노출.
+   */
+  show_absolute_time: boolean;
+  /**
+   * 사내 DRM 등으로 일반 파싱이 실패한 파일을, 설치된 MS Office 를 COM 자동화로
+   * 띄워 읽는다 (Windows 전용 · 기본 off). 파싱 실패 시에만 동작하는 최후 fallback.
+   */
+  use_wincom_for_docx?: boolean;
+  use_wincom_for_xlsx?: boolean;
+  use_wincom_for_pptx?: boolean;
+}

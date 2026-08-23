@@ -1,0 +1,732 @@
+import { useState, useEffect, useCallback, useMemo, useRef, startTransition } from "react";
+import { invokeWithTimeout, IPC_TIMEOUT } from "../utils/invokeWithTimeout";
+import { logToBackend } from "../utils/errorLogger";
+import type {
+  SearchResult,
+  SearchResponse,
+  SearchMode,
+  SearchFilters,
+  FileTypeFilter,
+  GroupedSearchResult,
+  ViewMode,
+  SearchParadigm,
+  SmartSearchResponse,
+  ParsedQueryInfo,
+  KeywordMatchMode,
+} from "../types/search";
+import { DEFAULT_FILTERS } from "../types/search";
+import { SEARCH_COMMANDS } from "../types/api";
+import { getErrorMessage } from "../types/error";
+import { textSimilarity } from "../utils/textSimilarity";
+
+/** 동일 파일 내 유사 청크 병합 임계값 (Jaccard bigram) */
+const CHUNK_DEDUP_THRESHOLD = 0.8;
+
+/** 스니펫/프리뷰 정규화 (하이라이트 마커 제거) */
+function chunkCompareText(r: SearchResult): string {
+  const src = r.snippet ?? r.content_preview ?? "";
+  return src.replace(/\[\[\/?HL\]\]/g, "");
+}
+
+/** 같은 파일 내 중복 청크 dedup: 신뢰도 높은 순 greedy. O(N²)이지만 파일당 수십 개 수준. */
+function dedupSimilarChunks(chunks: SearchResult[]): SearchResult[] {
+  if (chunks.length <= 1) return chunks;
+  // 신뢰도 내림차순
+  const sorted = [...chunks].sort((a, b) => b.confidence - a.confidence);
+  const kept: SearchResult[] = [];
+  const keptTexts: string[] = [];
+  for (const chunk of sorted) {
+    const text = chunkCompareText(chunk);
+    if (text.length < 10) {
+      kept.push(chunk);
+      keptTexts.push(text);
+      continue;
+    }
+    const isDup = keptTexts.some((t) => textSimilarity(text, t) >= CHUNK_DEDUP_THRESHOLD);
+    if (!isDup) {
+      kept.push(chunk);
+      keptTexts.push(text);
+    }
+  }
+  // chunk_index 오름차순 복원 (히트맵 렌더 자연스럽게)
+  kept.sort((a, b) => a.chunk_index - b.chunk_index);
+  return kept;
+}
+
+interface UseSearchOptions {
+  debounceMs?: number;
+  minConfidence?: number;
+}
+
+// LRU 캐시 (검색 결과 캐싱)
+const CACHE_MAX_SIZE = 50;
+const CACHE_TTL_MS = 30000; // 30초
+const COMPOSITION_IDLE_MS = 300;
+
+interface CacheEntry {
+  results: SearchResult[];
+  filenameResults: SearchResult[];
+  searchTime: number;
+  timestamp: number;
+}
+
+const searchCache = new Map<string, CacheEntry>();
+let sweepTimerId: ReturnType<typeof setInterval> | null = null;
+
+// HMR 시 이전 모듈의 sweepTimer 정리 (Vite dev mode)
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    if (sweepTimerId !== null) {
+      clearInterval(sweepTimerId);
+      sweepTimerId = null;
+    }
+    searchCache.clear();
+  });
+}
+
+/** 만료 엔트리 proactive sweep (CACHE_TTL_MS 간격) */
+function ensureSweepTimer(): void {
+  if (sweepTimerId !== null) return;
+  sweepTimerId = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of searchCache) {
+      if (now - entry.timestamp > CACHE_TTL_MS) {
+        searchCache.delete(key);
+      }
+    }
+    // 캐시 비면 타이머 중지 (리소스 절약)
+    if (searchCache.size === 0 && sweepTimerId !== null) {
+      clearInterval(sweepTimerId);
+      sweepTimerId = null;
+    }
+  }, CACHE_TTL_MS);
+}
+
+/** 검색 캐시 전체 초기화 (데이터 리셋 시 호출) */
+export function clearSearchCache(): void {
+  searchCache.clear();
+  if (sweepTimerId !== null) {
+    clearInterval(sweepTimerId);
+    sweepTimerId = null;
+  }
+}
+
+function getCacheKey(query: string, mode: SearchMode, excludeFilename: boolean, searchScope: string | null, kwMode?: KeywordMatchMode): string {
+  return JSON.stringify([mode, excludeFilename, searchScope, kwMode ?? "and", query.trim().toLowerCase()]);
+}
+
+function getFromCache(key: string): CacheEntry | null {
+  const entry = searchCache.get(key);
+  if (!entry) return null;
+
+  // TTL 체크
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+    searchCache.delete(key);
+    return null;
+  }
+
+  // LRU: 접근 시 맨 뒤로 이동
+  searchCache.delete(key);
+  searchCache.set(key, entry);
+  return entry;
+}
+
+function setToCache(key: string, entry: Omit<CacheEntry, "timestamp">): void {
+  // LRU: 최대 크기 초과 시 가장 오래된 항목 제거
+  if (searchCache.size >= CACHE_MAX_SIZE) {
+    const firstKey = searchCache.keys().next().value;
+    if (firstKey) searchCache.delete(firstKey);
+  }
+  searchCache.set(key, { ...entry, timestamp: Date.now() });
+  ensureSweepTimer();
+}
+
+interface UseSearchReturn {
+  query: string;
+  setQuery: (query: string) => void;
+  /** 현재 결과를 생성한 쿼리 (결과와 함께 갱신). 하이라이트/타이머용 — 라이브 query 와 분리 */
+  searchedQuery: string;
+  results: SearchResult[];
+  /** 파일명 검색 결과 (통합 모드에서 상단 표시용) */
+  filenameResults: SearchResult[];
+  filteredResults: SearchResult[];
+  groupedResults: GroupedSearchResult[];
+  searchTime: number | null;
+  isLoading: boolean;
+  error: string | null;
+  clearError: () => void;
+  searchMode: SearchMode;
+  setSearchMode: (mode: SearchMode) => void;
+  filters: SearchFilters;
+  setFilters: (filters: SearchFilters | ((prev: SearchFilters) => SearchFilters)) => void;
+  viewMode: ViewMode;
+  setViewMode: (mode: ViewMode) => void;
+  /** 결과 내 검색 쿼리 */
+  refineQuery: string;
+  setRefineQuery: (query: string) => void;
+  /** 결과 내 검색 초기화 */
+  clearRefine: () => void;
+  /** 결과 내 검색 활성화 여부 */
+  isRefineActive: boolean;
+  /** IME 조합 상태 설정 (compositionEnd 시 최종 쿼리 전달) */
+  setComposing: (v: boolean, finalQuery?: string) => void;
+  /** 캐시 무효화 + 재검색 (데이터 변경 시) */
+  invalidate: () => void;
+  /** 검색 패러다임 (즉시/자연어) */
+  paradigm: SearchParadigm;
+  setParadigm: (p: SearchParadigm) => void;
+  /** 자연어 검색 실행 (Enter 키) */
+  submitNaturalQuery: () => void;
+  /** NL 파서 결과 (자연어 모드) */
+  parsedQuery: ParsedQueryInfo | null;
+  /** 자연어 검색 실행 여부 (결과 0건 vs 미실행 구분) */
+  nlSubmitted: boolean;
+  /** 키워드 매칭 모드 (AND/OR/EXACT) */
+  keywordMatchMode: KeywordMatchMode;
+  setKeywordMatchMode: (mode: KeywordMatchMode) => void;
+}
+
+/**
+ * 검색 로직 훅 (디바운스 포함)
+ */
+export function useSearch(options: UseSearchOptions = {}): UseSearchReturn {
+  const { debounceMs = 150 } = options;
+  // minConfidence는 외부에서 변경될 수 있으므로 직접 참조
+  const minConfidence = options.minConfidence ?? 0;
+
+  const [query, setQueryInternal] = useState("");
+  const [results, setResults] = useState<SearchResult[]>([]);
+  // 결과를 생성한 "검색된 쿼리". 결과 커밋과 같은 transition 으로 갱신해 라이브 query 와
+  // 분리한다 — 하이라이트/타이머(typo/recent)가 이 값을 쓰면 키스트로크마다 재계산되지
+  // 않고, 보이는 결과와 하이라이트 대상이 항상 일치한다(P2-2).
+  const [searchedQuery, setSearchedQuery] = useState("");
+  const [filenameResults, setFilenameResults] = useState<SearchResult[]>([]);
+  const [searchTime, setSearchTime] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [searchMode, setSearchMode] = useState<SearchMode>("keyword");
+  const [keywordMatchMode, setKeywordMatchModeInternal] = useState<KeywordMatchMode>("and");
+  const keywordMatchModeRef = useRef<KeywordMatchMode>("and");
+
+  // 검색 패러다임 (즉시/자연어)
+  const [paradigm, setParadigmInternal] = useState<SearchParadigm>(() => {
+    try {
+      const stored = localStorage.getItem("docufinder_paradigm");
+      return stored === "instant" || stored === "natural" ? stored : "instant";
+    } catch { return "instant"; }
+  });
+  const [parsedQuery, setParsedQuery] = useState<ParsedQueryInfo | null>(null);
+  // 자연어 모드에서 검색 실행 여부 (결과 0건과 미실행 구분용)
+  const [nlSubmitted, setNlSubmitted] = useState(false);
+  // 쿼리 변경 시 nlSubmitted 리셋하는 래퍼 (안정적 참조)
+  const setQuery = useCallback((q: string) => {
+    setQueryInternal(q);
+    setNlSubmitted(false);
+  }, []);
+  // IME 조합 중 여부
+  const isComposingRef = useRef(false);
+  // 검색 요청 ID (이전 검색 결과 무시용)
+  const searchIdRef = useRef(0);
+  const [filters, setFiltersInternal] = useState<SearchFilters>(() => {
+    // localStorage에서 영속 필터 복원 (sortBy, excludeFilename)
+    let restored = { ...DEFAULT_FILTERS };
+    try {
+      const savedSort = localStorage.getItem("docufinder_sort_by");
+      if (savedSort) restored.sortBy = savedSort as SearchFilters["sortBy"];
+      const savedExclude = localStorage.getItem("docufinder_exclude_filename");
+      if (savedExclude !== null) restored.excludeFilename = JSON.parse(savedExclude);
+    } catch {}
+    return restored;
+  });
+  const [viewMode, setViewModeInternal] = useState<ViewMode>(() => {
+    try {
+      const saved = localStorage.getItem("docufinder_view_mode");
+      if (saved === "flat" || saved === "grouped") return saved;
+    } catch {}
+    return "grouped";
+  });
+  const setViewMode = useCallback((mode: ViewMode) => {
+    setViewModeInternal(mode);
+    try { localStorage.setItem("docufinder_view_mode", mode); } catch {}
+  }, []);
+  const [refineQuery, setRefineQuery] = useState("");
+  const [debouncedRefineQuery, setDebouncedRefineQuery] = useState("");
+
+  // refineQuery debounce (300ms)
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedRefineQuery(refineQuery), 300);
+    return () => clearTimeout(timer);
+  }, [refineQuery]);
+
+  const clearError = useCallback(() => setError(null), []);
+  const clearRefine = useCallback(() => { setRefineQuery(""); setDebouncedRefineQuery(""); }, []);
+
+  // 영속 필터 변경 시 localStorage 저장 (sortBy, excludeFilename)
+  const prevPersisted = useRef({ sortBy: filters.sortBy, excludeFilename: filters.excludeFilename });
+  const setFilters = useCallback((newFiltersOrUpdater: SearchFilters | ((prev: SearchFilters) => SearchFilters)) => {
+    setFiltersInternal((prev) => {
+      const newFilters = typeof newFiltersOrUpdater === "function" ? newFiltersOrUpdater(prev) : newFiltersOrUpdater;
+      try {
+        if (newFilters.sortBy !== prevPersisted.current.sortBy) {
+          prevPersisted.current.sortBy = newFilters.sortBy;
+          localStorage.setItem("docufinder_sort_by", newFilters.sortBy);
+        }
+        if (newFilters.excludeFilename !== prevPersisted.current.excludeFilename) {
+          prevPersisted.current.excludeFilename = newFilters.excludeFilename;
+          localStorage.setItem("docufinder_exclude_filename", JSON.stringify(newFilters.excludeFilename));
+        }
+      } catch {}
+      return newFilters;
+    });
+  }, []);
+
+  // keywordMatchMode 변경 래퍼 (ref 동기화 + 재검색 트리거)
+  const setKeywordMatchMode = useCallback((mode: KeywordMatchMode) => {
+    setKeywordMatchModeInternal(mode);
+    keywordMatchModeRef.current = mode;
+  }, []);
+
+  // 검색 실행 함수 (결과 업데이트는 startTransition으로 입력 블로킹 방지)
+  const executeSearch = useCallback(
+    async (searchQuery: string, mode: SearchMode) => {
+      // 항상 ID 증가 — 빈 쿼리/캐시 히트 시에도 이전 비동기 검색 무효화
+      const currentId = ++searchIdRef.current;
+
+      if (!searchQuery.trim()) {
+        startTransition(() => {
+          setSearchedQuery("");
+          setResults([]);
+          setFilenameResults([]);
+          setSearchTime(null);
+        });
+        setIsLoading(false);
+        return;
+      }
+
+      // LRU 캐시 확인
+      const kwMode = keywordMatchModeRef.current;
+      const cacheKey = getCacheKey(searchQuery, mode, filters.excludeFilename, filters.searchScope, kwMode);
+      const cached = getFromCache(cacheKey);
+      if (cached) {
+        startTransition(() => {
+          setSearchedQuery(searchQuery);
+          setResults(cached.results);
+          setFilenameResults(cached.filenameResults);
+          setSearchTime(cached.searchTime);
+        });
+        setIsLoading(false);
+        return;
+      }
+
+      setIsLoading(true);
+      setError(null);
+
+      try {
+        if (mode === "filename") {
+          const response = await invokeWithTimeout<SearchResponse>(SEARCH_COMMANDS[mode], {
+            query: searchQuery,
+            folderScope: filters.searchScope,
+          }, IPC_TIMEOUT.SEARCH);
+          if (searchIdRef.current !== currentId) return;
+          // 캐시 저장
+          setToCache(cacheKey, {
+            results: response.results,
+            filenameResults: [],
+            searchTime: response.search_time_ms,
+          });
+          startTransition(() => {
+            setSearchedQuery(searchQuery);
+            setResults(response.results);
+            setFilenameResults([]);
+            setSearchTime(response.search_time_ms);
+            setIsLoading(false);
+          });
+          return;
+        } else {
+          // excludeFilename이면 파일명 검색 스킵 (불필요한 백엔드 호출 방지)
+          const ipcArgs = {
+            query: searchQuery,
+            folderScope: filters.searchScope,
+            // keyword/hybrid 검색에 키워드 매칭 모드 전달 (AND/OR/EXACT)
+            ...(kwMode !== "and" && (mode === "keyword" || mode === "hybrid") && { keywordMode: kwMode }),
+          };
+          const contentPromise = invokeWithTimeout<SearchResponse>(SEARCH_COMMANDS[mode], ipcArgs, IPC_TIMEOUT.SEARCH);
+          const filenamePromise = filters.excludeFilename
+            ? Promise.resolve({ results: [], search_time_ms: 0, total_count: 0 })
+            : invokeWithTimeout<SearchResponse>(SEARCH_COMMANDS.filename, ipcArgs, IPC_TIMEOUT.SEARCH);
+
+          // 파일명 검색 실패가 본문 검색까지 죽이지 않도록 allSettled 사용
+          const [contentResult, filenameResult] = await Promise.allSettled([
+            contentPromise,
+            filenamePromise,
+          ]);
+          if (searchIdRef.current !== currentId) return;
+
+          // 본문 검색 실패 시 에러 throw
+          if (contentResult.status === "rejected") {
+            throw contentResult.reason;
+          }
+          const contentResponse = contentResult.value;
+          // 파일명 검색 실패 시 graceful degrade (경고 로그)
+          const filenameResponse = filenameResult.status === "fulfilled"
+            ? filenameResult.value
+            : { results: [], search_time_ms: 0, total_count: 0 };
+          if (filenameResult.status === "rejected") {
+            console.warn("[Search] 파일명 검색 실패:", filenameResult.reason);
+          }
+
+          // 캐시 저장
+          setToCache(cacheKey, {
+            results: contentResponse.results,
+            filenameResults: filenameResponse.results,
+            searchTime: contentResponse.search_time_ms,
+          });
+          startTransition(() => {
+            setSearchedQuery(searchQuery);
+            setResults(contentResponse.results);
+            setFilenameResults(filenameResponse.results);
+            setSearchTime(contentResponse.search_time_ms);
+            setIsLoading(false);
+          });
+        }
+      } catch (err) {
+        if (searchIdRef.current !== currentId) return;
+        const message = getErrorMessage(err);
+        logToBackend("error", "Search failed", message, "useSearch");
+        setError(`검색 실패: ${message}`);
+        startTransition(() => {
+          setSearchedQuery(searchQuery);
+          setResults([]);
+          setFilenameResults([]);
+          setSearchTime(null);
+          setIsLoading(false);
+        });
+      }
+    },
+    [filters.excludeFilename, filters.searchScope]
+  );
+
+  // IME 상태 설정 (SearchBar에서 호출)
+  // compositionEnd 이후에도 debounce에 의해 검색되도록만 상태 갱신
+  const setComposing = useCallback((v: boolean, finalQuery?: string) => {
+    isComposingRef.current = v;
+    if (!v && finalQuery !== undefined && finalQuery !== query) {
+      setQuery(finalQuery);
+    }
+  }, [query, setQuery]);
+
+  // paradigm 전환 — 쿼리는 보존(같은 검색어로 모드만 바꾸는 동선 지원), 결과/파싱 상태만 초기화.
+  // instant 로 전환 시 아래 debounce effect(deps에 paradigm 포함)가 보존된 쿼리로 자동 재검색하고,
+  // natural/question 은 Enter 제출 대기 상태가 된다.
+  const setParadigm = useCallback((p: SearchParadigm) => {
+    // in-flight 검색 무효화 — ID를 올리지 않으면 IPC 응답 대기 중이던 이전 모드의
+    // 결과가 시퀀스 가드를 통과해, 방금 비운 화면 위에 stale 결과가 되살아난다
+    searchIdRef.current++;
+    setParadigmInternal(p);
+    try { localStorage.setItem("docufinder_paradigm", p); } catch {}
+    setParsedQuery(null);
+    setNlSubmitted(false);
+    clearSearchCache();
+    startTransition(() => {
+      setSearchedQuery("");
+      setResults([]);
+      setFilenameResults([]);
+      setSearchTime(null);
+    });
+    setError(null);
+    setIsLoading(false);
+  }, []);
+
+  // 자연어 검색 실행 (Enter 키)
+  const submitNaturalQuery = useCallback(() => {
+    if (paradigm !== "natural" || !query.trim()) return;
+
+    const currentId = ++searchIdRef.current;
+    setIsLoading(true);
+    setError(null);
+    setNlSubmitted(true);
+
+    (async () => {
+      try {
+        const response = await invokeWithTimeout<SmartSearchResponse>(
+          "search_smart",
+          { query: query.trim(), folderScope: filters.searchScope },
+          IPC_TIMEOUT.SEARCH
+        );
+        if (searchIdRef.current !== currentId) return;
+
+        setParsedQuery(response.parsed_query);
+        startTransition(() => {
+          setSearchedQuery(query.trim());
+          setResults(response.results);
+          setFilenameResults([]);
+          setSearchTime(response.search_time_ms);
+          setIsLoading(false);
+        });
+      } catch (err) {
+        if (searchIdRef.current !== currentId) return;
+        const message = getErrorMessage(err);
+        logToBackend("error", "Smart search failed", message, "useSearch");
+        setError(`검색 실패: ${message}`);
+        startTransition(() => {
+          setSearchedQuery(query.trim());
+          setResults([]);
+          setFilenameResults([]);
+          setSearchTime(null);
+          setIsLoading(false);
+        });
+      }
+    })();
+  }, [paradigm, query, filters.searchScope]);
+
+  // 디바운스 검색 — 즉시 모드에서만 실행, 자연어 모드에서는 스킵
+  useEffect(() => {
+    if (paradigm !== "instant") return; // 즉시 모드만 디바운스 검색
+
+    const delay = isComposingRef.current
+      ? Math.max(debounceMs, COMPOSITION_IDLE_MS)
+      : debounceMs;
+    const timer = setTimeout(() => {
+      if (isComposingRef.current) {
+        isComposingRef.current = false;
+      }
+      executeSearch(query, searchMode);
+    }, delay);
+
+    return () => clearTimeout(timer);
+  }, [query, searchMode, keywordMatchMode, debounceMs, executeSearch, paradigm]);
+
+  // 필터링된 결과
+  const filteredResults = useMemo(() => {
+    const needsFilter =
+      minConfidence > 0 ||
+      filters.keywordOnly ||
+      filters.fileTypes.length > 0 ||
+      filters.dateRange !== "all" ||
+      debouncedRefineQuery.trim().length > 0;
+    const needsSort = filters.sortBy !== "relevance";
+
+    // 필터/정렬 불필요 시 원본 반환 (배열 복사 회피)
+    if (!needsFilter && !needsSort) {
+      return results;
+    }
+
+    let filtered = [...results];
+
+    if (minConfidence > 0) {
+      filtered = filtered.filter((r) => r.confidence >= minConfidence);
+    }
+
+    if (filters.keywordOnly) {
+      filtered = filtered.filter((r) => {
+        // 대소문자 무관하게 비교 (serde 직렬화 호환성)
+        const type = (r.match_type ?? "").toLowerCase();
+        return type === "keyword" || type === "hybrid";
+      });
+    }
+
+    // 날짜 범위 필터
+    if (filters.dateRange !== "all") {
+      const nowSec = Math.floor(Date.now() / 1000);
+      let minTime = 0;
+
+      if (filters.dateRange.startsWith("custom:")) {
+        const days = parseInt(filters.dateRange.slice(7), 10);
+        if (!isNaN(days) && days > 0) minTime = nowSec - 86400 * days;
+      } else {
+        const cutoff: Record<string, number> = {
+          today: nowSec - 86400,
+          week: nowSec - 86400 * 7,
+          month: nowSec - 86400 * 30,
+          quarter: nowSec - 86400 * 90,
+          half: nowSec - 86400 * 180,
+          year: nowSec - 86400 * 365,
+        };
+        minTime = cutoff[filters.dateRange] ?? 0;
+      }
+
+      filtered = filtered.filter((r) => (r.modified_at ?? 0) >= minTime);
+    }
+
+    // 파일 타입 필터 (다중 선택)
+    if (filters.fileTypes.length > 0) {
+      const extMap: Record<FileTypeFilter, string[]> = {
+        hwpx: ["hwpx"],
+        docx: ["docx", "doc"],
+        pptx: ["pptx", "ppt"],
+        xlsx: ["xlsx", "xls"],
+        pdf: ["pdf"],
+        txt: ["txt", "md"],
+      };
+      const allowedExts = filters.fileTypes.flatMap((ft) => extMap[ft] ?? []);
+      filtered = filtered.filter((r) => {
+        const ext = r.file_name.split(".").pop()?.toLowerCase() || "";
+        return allowedExts.includes(ext);
+      });
+    }
+
+    // 정렬
+    switch (filters.sortBy) {
+      case "relevance":
+        // 이미 score 순으로 정렬됨
+        break;
+      case "confidence":
+        // 신뢰도 높은 순
+        filtered.sort((a, b) => b.confidence - a.confidence);
+        break;
+      case "date_desc":
+        // 최신순 (수정일 내림차순)
+        filtered.sort((a, b) => (b.modified_at ?? 0) - (a.modified_at ?? 0));
+        break;
+      case "date_asc":
+        // 오래된순 (수정일 오름차순)
+        filtered.sort((a, b) => (a.modified_at ?? 0) - (b.modified_at ?? 0));
+        break;
+      case "name":
+        filtered.sort((a, b) => a.file_name.localeCompare(b.file_name, "ko"));
+        break;
+    }
+
+    // 결과 내 검색 필터링 (debounced)
+    // ⚡ full_content 대신 snippet/content_preview 사용 (성능 최적화)
+    if (debouncedRefineQuery.trim()) {
+      const refineKeywords = debouncedRefineQuery.trim().toLowerCase().split(/\s+/);
+      filtered = filtered.filter((r) => {
+        const content = (r.snippet || r.content_preview || "").toLowerCase();
+        // 모든 키워드가 포함되어야 함 (AND 조건)
+        return refineKeywords.every((kw) => content.includes(kw));
+      });
+    }
+
+    return filtered;
+  }, [results, filters, minConfidence, debouncedRefineQuery]);
+
+  // 파일명 검색 결과도 결과 내 검색 필터링 + 정렬 (내용 섹션과 동일 정책)
+  const filteredFilenameResults = useMemo(() => {
+    const needsRefine = debouncedRefineQuery.trim().length > 0;
+    const needsSort = filters.sortBy !== "relevance";
+    if (!needsRefine && !needsSort) return filenameResults;
+
+    let list = filenameResults;
+    if (needsRefine) {
+      const keywords = debouncedRefineQuery.trim().toLowerCase().split(/\s+/);
+      list = list.filter((r) => {
+        const fileName = r.file_name.toLowerCase();
+        return keywords.every((kw) => fileName.includes(kw));
+      });
+    }
+
+    if (needsSort) {
+      const sorted = list === filenameResults ? [...list] : list;
+      switch (filters.sortBy) {
+        case "confidence":
+          sorted.sort((a, b) => b.confidence - a.confidence);
+          break;
+        case "date_desc":
+          sorted.sort((a, b) => (b.modified_at ?? 0) - (a.modified_at ?? 0));
+          break;
+        case "date_asc":
+          sorted.sort((a, b) => (a.modified_at ?? 0) - (b.modified_at ?? 0));
+          break;
+        case "name":
+          sorted.sort((a, b) => a.file_name.localeCompare(b.file_name, "ko"));
+          break;
+      }
+      return sorted;
+    }
+    return list;
+  }, [filenameResults, debouncedRefineQuery, filters.sortBy]);
+
+  // 파일별 그룹핑 결과 (유사 청크 dedup 포함)
+  const groupedResults = useMemo(() => {
+    const groups = new Map<string, GroupedSearchResult>();
+
+    for (const result of filteredResults) {
+      const existing = groups.get(result.file_path);
+      if (existing) {
+        existing.chunks.push(result);
+        existing.top_confidence = Math.max(existing.top_confidence, result.confidence);
+        existing.total_matches++;
+      } else {
+        groups.set(result.file_path, {
+          file_path: result.file_path,
+          file_name: result.file_name,
+          chunks: [result],
+          top_confidence: result.confidence,
+          total_matches: 1,
+        });
+      }
+    }
+
+    // 동일 파일 내 80%+ 유사 청크 병합 (Jaccard bigram)
+    for (const g of groups.values()) {
+      if (g.chunks.length > 1) {
+        const deduped = dedupSimilarChunks(g.chunks);
+        g.chunks = deduped;
+        g.total_matches = deduped.length;
+      }
+    }
+
+    // 정렬: sortBy=relevance 일 때만 top_confidence 로 재정렬.
+    // 나머지(confidence/date_desc/date_asc/name)는 filteredResults 의 순서를
+    // 유지해야 하므로 Map 삽입 순서 그대로 반환한다. Map 은 insertion order
+    // 를 보장하므로 각 파일의 "첫 청크" 순서 = filteredResults 의 정렬 순서.
+    const groupList = Array.from(groups.values());
+    if (filters.sortBy === "relevance") {
+      groupList.sort((a, b) => b.top_confidence - a.top_confidence);
+    }
+    return groupList;
+  }, [filteredResults, filters.sortBy]);
+
+  // 캐시 무효화 + 재검색 (폴더 삭제 등 데이터 변경 시)
+  const invalidate = useCallback(() => {
+    searchCache.clear();
+    if (query.trim()) {
+      executeSearch(query, searchMode);
+    } else {
+      // 빈 쿼리 분기도 in-flight 응답이 초기화를 덮지 않도록 무효화 (setParadigm과 동일).
+      // 무효화된 검색은 가드에서 조기 리턴해 isLoading을 못 끄므로 여기서 해제.
+      searchIdRef.current++;
+      setIsLoading(false);
+      startTransition(() => {
+        setSearchedQuery("");
+        setResults([]);
+        setFilenameResults([]);
+        setSearchTime(null);
+      });
+    }
+  }, [query, searchMode, executeSearch]);
+
+  return {
+    query,
+    setQuery,
+    searchedQuery,
+    results,
+    filenameResults: filteredFilenameResults,
+    filteredResults,
+    groupedResults,
+    searchTime,
+    isLoading,
+    error,
+    clearError,
+    searchMode,
+    setSearchMode,
+    filters,
+    setFilters,
+    viewMode,
+    setViewMode,
+    refineQuery,
+    setRefineQuery,
+    clearRefine,
+    isRefineActive: refineQuery.trim().length > 0,
+    setComposing,
+    invalidate,
+    paradigm,
+    setParadigm,
+    submitNaturalQuery,
+    parsedQuery,
+    nlSubmitted,
+    keywordMatchMode,
+    setKeywordMatchMode,
+  };
+}

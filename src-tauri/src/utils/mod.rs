@@ -1,0 +1,26 @@
+pub mod access_diag;
+pub mod cloud_detect;
+pub mod disk_info;
+pub mod dll_diag;
+pub mod elevation;
+pub mod filename_normalize;
+pub mod folder_scope;
+pub mod idle_detector;
+pub mod network_path;
+pub mod process_job;
+pub mod text_normalize;
+
+pub use text_normalize::normalize_text;
+
+/// PowerShell `-EncodedCommand`용 Base64(UTF-16LE) 인코딩.
+/// 문자열 보간 기반 인젝션을 원천 차단한다.
+/// lite 빌드는 PowerShell 을 아예 호출하지 않는다 (`disk_info` 주석 참고).
+#[cfg(all(windows, feature = "online"))]
+pub fn encode_powershell_command(script: &str) -> String {
+    use base64::Engine;
+    let utf16le: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(&utf16le)
+}

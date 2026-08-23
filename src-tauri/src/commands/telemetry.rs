@@ -1,0 +1,330 @@
+//! 오류 리포트 — 클라이언트 에러를 Telegram Bot 으로 전송.
+//!
+//! 토큰/채팅 ID 는 빌드 시점 환경변수 로 주입된다. 빈 값이면 전송하지 않음 (개발 환경 보호).
+//!   TELEGRAM_BOT_TOKEN=xxxxxx:yyyy
+//!   TELEGRAM_CHAT_ID=-1001234567890
+//!
+//! 프라이버시:
+//!   - 문서 내용, 검색어 절대 전송 안 함
+//!   - 파일 경로는 %USERPROFILE% → ~ 마스킹
+//!   - 설정 error_reporting_enabled=false 면 전송 안 함 (프론트에서 pre-check)
+//!
+//! 토큰 노출 리스크:
+//!   - 바이너리에서 strings 로 추출 가능. 악용 시 BotFather 로 revoke + 새 토큰으로 재빌드.
+//!
+//! lite(내부망) 빌드: `online` feature 가 꺼지면 전송 경로 전체가 컴파일에서 빠진다.
+//! 서명 없는 실행 파일이 외부 호스트로 주기적 HTTPS POST 를 보내는 형태는 APT 대응 제품이
+//! C2 비컨으로 분류하는 대표 패턴이라, 내부망 배포본에서는 코드째 제거하는 편이 맞다.
+//! 크래시 로그는 그대로 로컬 파일에만 남는다.
+
+use std::path::PathBuf;
+use std::sync::RwLock;
+
+use serde::{Deserialize, Serialize};
+use tauri::State;
+
+use crate::AppContainer;
+
+#[cfg(feature = "online")]
+const TELEGRAM_BOT_TOKEN: &str = match option_env!("TELEGRAM_BOT_TOKEN") {
+    Some(t) => t,
+    None => "",
+};
+#[cfg(feature = "online")]
+const TELEGRAM_CHAT_ID: &str = match option_env!("TELEGRAM_CHAT_ID") {
+    Some(c) => c,
+    None => "",
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorReport {
+    /// "frontend" | "backend" | "panic"
+    pub source: String,
+    /// 짧은 요약 (60자 권장)
+    pub title: String,
+    /// 상세 메시지 + 스택 (multi-line OK)
+    pub message: String,
+    /// 컨텍스트 (경로/액션/버튼 등) — 자유형식 key:value
+    #[serde(default)]
+    pub context: std::collections::HashMap<String, String>,
+}
+
+/// 앱 버전 — Cargo.toml 에서 빌드 시 주입
+#[cfg(feature = "online")]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// 경로 내 사용자 디렉토리를 ~ 로 치환
+#[cfg(feature = "online")]
+fn anonymize(text: &str) -> String {
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if home.is_empty() {
+        return text.to_string();
+    }
+    text.replace(&home, "~")
+}
+
+/// Telegram 에 POST. 블로킹 호출 (ureq).
+#[cfg(feature = "online")]
+fn send_to_telegram(text: &str) -> Result<(), String> {
+    if TELEGRAM_BOT_TOKEN.is_empty() || TELEGRAM_CHAT_ID.is_empty() {
+        return Err("Telegram credentials not configured at build time".into());
+    }
+    let url = format!(
+        "https://api.telegram.org/bot{}/sendMessage",
+        TELEGRAM_BOT_TOKEN
+    );
+    let body = serde_json::json!({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true,
+    });
+    match ureq::post(&url).send_json(body) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("telegram send failed: {e}")),
+    }
+}
+
+/// lite 빌드의 `report_error` — 외부 전송 없이 로컬 로그에만 남긴다.
+///
+/// 커맨드 자체는 유지한다. 프론트 errorLogger 가 무조건 호출하는 경로라, 없애면
+/// 오류가 날 때마다 IPC 실패가 겹쳐 진단이 더 어려워진다.
+#[cfg(not(feature = "online"))]
+#[tauri::command]
+pub async fn report_error(
+    _state: State<'_, RwLock<AppContainer>>,
+    payload: ErrorReport,
+) -> Result<(), String> {
+    tracing::error!(
+        "[{}] {} — {}",
+        payload.source,
+        payload.title,
+        truncate(&payload.message, 1500)
+    );
+    Ok(())
+}
+
+/// 프론트엔드 호출: 백엔드에서도 사용자 설정을 재확인한다.
+/// 렌더러가 오염되어도 동의 없는 전송이 발생하지 않도록 IPC 진입점에서 게이트.
+#[cfg(feature = "online")]
+#[tauri::command]
+pub async fn report_error(
+    state: State<'_, RwLock<AppContainer>>,
+    payload: ErrorReport,
+) -> Result<(), String> {
+    let enabled = state
+        .read()
+        .map_err(|e| format!("settings read failed: {e}"))?
+        .get_settings()
+        .error_reporting_enabled;
+    if !enabled {
+        return Ok(());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let msg = format_report(&payload);
+        send_to_telegram(&msg)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+#[cfg(feature = "online")]
+fn format_report(r: &ErrorReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "<b>🐛 [{v}] {src}</b>\n<b>{title}</b>",
+        v = app_version(),
+        src = r.source,
+        title = html_escape(&r.title),
+    );
+    let _ = writeln!(
+        out,
+        "\n<pre>{}</pre>",
+        html_escape(&anonymize(truncate(&r.message, 1500)))
+    );
+    if !r.context.is_empty() {
+        let _ = writeln!(out, "\n<b>Context</b>");
+        for (k, v) in &r.context {
+            let _ = writeln!(
+                out,
+                "• <code>{}</code>: {}",
+                html_escape(k),
+                html_escape(&anonymize(truncate(v, 200))),
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\n<i>os={}, arch={}</i>",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    out
+}
+
+#[cfg(feature = "online")]
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        // char boundary 안전하게
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+}
+
+/// lite 빌드: 외부 전송 없음. crash 로그는 panic hook 이 로컬 파일에 남긴다.
+#[cfg(not(feature = "online"))]
+pub fn report_panic_sync(_location: &str, _message: &str) {}
+
+/// lite 빌드: 미전송 crash 로그 플러시 대상이 없다 (전송 경로 자체가 없음).
+#[cfg(not(feature = "online"))]
+pub fn spawn_flush_pending_crash_logs(_app_data_dir: PathBuf) {}
+
+/// Rust panic hook 에서 호출 (sync).
+///
+/// build-time env 와 **사용자 설정** 양쪽을 모두 통과해야 전송한다.
+/// panic 상황이라도 opt-out 을 무시하지 않는다 — 전송이 막혀도 크래시 로그는
+/// 로컬에 남고, 사용자가 나중에 토글을 켜면 `spawn_flush_pending_crash_logs` 가
+/// 처리한다.
+#[cfg(feature = "online")]
+pub fn report_panic_sync(location: &str, message: &str) {
+    if TELEGRAM_BOT_TOKEN.is_empty() || TELEGRAM_CHAT_ID.is_empty() {
+        return;
+    }
+    let Some(app_data_dir) = dirs::data_dir().map(|d| d.join(crate::APP_IDENTIFIER)) else {
+        return;
+    };
+    if !crate::commands::settings::get_settings_sync(&app_data_dir).error_reporting_enabled {
+        return;
+    }
+    let report = ErrorReport {
+        source: "panic".into(),
+        title: format!("PANIC at {location}"),
+        message: message.to_string(),
+        context: std::collections::HashMap::new(),
+    };
+    let text = format_report(&report);
+    // best-effort, ignore result
+    let _ = send_to_telegram(&text);
+}
+
+/// 앱 시작 시 호출: 이전 세션에서 남긴 미전송 crash log 를 Telegram 으로 플러시.
+///
+/// 시나리오:
+///   - 네이티브 크래시 (SEGV / access violation / stack overflow) → panic hook 실행 실패 or 프로세스 즉시 종료
+///   - OOM kill / 외부 kill 전 panic hook 완료 실패
+///
+/// 동작:
+///   1. %APPDATA%\com.anything.app\crash-*.log 중 ".sent" suffix 없는 파일 찾기
+///   2. 각 파일의 최근 1MB 읽어 Telegram 전송
+///   3. 성공 시 ".sent" suffix 로 rename (중복 전송 방지)
+///
+/// 백그라운드 스레드에서 실행 (앱 시작 지연 방지).
+///
+/// 사용자 설정 `error_reporting_enabled` 가 false 면 전송하지 않고 ".sent" 로 마킹만 한다
+/// (이전 세션에서 켜뒀다가 끈 경우 잔존 로그가 재전송되지 않도록).
+#[cfg(feature = "online")]
+pub fn spawn_flush_pending_crash_logs(app_data_dir: PathBuf) {
+    if TELEGRAM_BOT_TOKEN.is_empty() || TELEGRAM_CHAT_ID.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Some(data_dir) = dirs::data_dir() else {
+            return;
+        };
+        let crash_dir = data_dir.join(crate::APP_IDENTIFIER);
+        let Ok(entries) = std::fs::read_dir(&crash_dir) else {
+            return;
+        };
+
+        // 사용자 설정 백엔드 게이트 — false 면 모든 미전송 파일을 .sent 로 마킹만 하고 종료.
+        // (사용자가 토글을 끄기 전에 쌓인 잔존 로그가 다음 시작 때 재전송되는 것 차단)
+        let enabled =
+            crate::commands::settings::get_settings_sync(&app_data_dir).error_reporting_enabled;
+        if !enabled {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with("crash-") && !name.ends_with(".sent") {
+                    let new_path = path.with_file_name(format!("{}.sent", name));
+                    let _ = std::fs::rename(&path, &new_path);
+                }
+            }
+            return;
+        }
+        // 게이트 통과 — 정상 플러시 루프 진행
+        let Ok(entries) = std::fs::read_dir(&crash_dir) else {
+            return;
+        };
+
+        // 오늘자 크래시만 전송 (이전 날짜 로그는 조용히 .sent 처리 — 재전송 스팸 방지)
+        let today_name = format!("crash-{}.log", chrono::Local::now().format("%Y-%m-%d"));
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !name.starts_with("crash-") || name.ends_with(".sent") {
+                continue;
+            }
+            // 오늘자 파일이 아니면 전송 건너뛰고 .sent 로 마킹해 다음 실행 때도 재검사 안 함.
+            if name != today_name {
+                let new_path = path.with_file_name(format!("{}.sent", name));
+                let _ = std::fs::rename(&path, &new_path);
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            // BENIGN 필터 — 이전 버전(tao 필터 추가 전 v2.5.5 이하)에서 이미 기록된 로그나
+            // panic hook 외 경로에서 기록된 로그가 모두 BENIGN 소스면 조용히 .sent 처리.
+            // 실시간 panic hook 과 동일한 필터를 적용해 재전송 스팸 차단.
+            if crate::panic_filter::is_all_benign(&content) {
+                let new_path = path.with_file_name(format!("{}.sent", name));
+                let _ = std::fs::rename(&path, &new_path);
+                continue;
+            }
+            // 최근 1MB만 (너무 크면 Telegram 4096자 제한에 걸림 — format_report 에서 잘림)
+            let tail = if content.len() > 1_000_000 {
+                &content[content.len() - 1_000_000..]
+            } else {
+                &content
+            };
+            let report = ErrorReport {
+                source: "crash-log".into(),
+                title: format!("Deferred crash report: {}", name),
+                message: tail.to_string(),
+                context: std::collections::HashMap::new(),
+            };
+            let text = format_report(&report);
+            if send_to_telegram(&text).is_ok() {
+                // .sent suffix 로 rename → 다음 실행 시 재전송 방지
+                let new_path = path.with_file_name(format!("{}.sent", name));
+                let _ = std::fs::rename(&path, &new_path);
+            }
+        }
+    });
+}

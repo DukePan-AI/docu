@@ -1,0 +1,1588 @@
+mod application; // 클린 아키텍처: Application Layer
+pub mod breadcrumb; // 현재 처리 중 파일/단계 추적 (panic hook 에서 읽음)
+mod commands;
+mod constants;
+mod db;
+mod embedder;
+mod error;
+mod indexer;
+// LLM 클라이언트 · 모델 자동 다운로드 — 둘 다 런타임 네트워크 경로라 lite 빌드에선 통째로 뺀다.
+#[cfg(feature = "online")]
+mod llm; // LLM 클라이언트 (RAG + AI 요약)
+#[cfg(feature = "online")]
+mod model_downloader; // 모델 자동 다운로드
+pub mod ocr; // PaddleOCR ONNX 기반 OCR 엔진
+pub mod panic_filter; // crash.log BENIGN 필터 (panic hook + deferred flush 공유)
+pub mod parsers;
+mod search;
+mod tokenizer; // 한국어 형태소 분석 (Phase 5)
+mod utils; // 유틸리티 (idle_detector, disk_info)
+
+#[cfg(test)]
+mod perf_bench; // 성능 계측 하니스 (릴리스 미포함, cargo test --release perf_)
+
+// Windows: fixed-version WebView2 Runtime detection + environment injection
+// (이슈 #24 LTSC 1809 + admin 없음 + GPO 차단 환경 대응)
+#[cfg(target_os = "windows")]
+mod webview2_runtime;
+
+pub use application::container::AppContainer;
+pub use error::{ApiError, ApiResult};
+
+/// `tauri.conf.json` 의 `identifier` 와 반드시 같아야 하는 값.
+///
+/// panic hook 은 Tauri 앱이 만들어지기 전에 설치되므로 `app.path().app_data_dir()` 를 쓸 수
+/// 없고 `dirs::data_dir()` 아래 경로를 직접 조립한다. lite 빌드는 일반 배포판과 설정/DB 를
+/// 섞지 않으려고 별도 identifier 를 쓰므로(그래야 lite 의 기능 강제 off 가 일반 설치본의
+/// 설정을 덮어쓰지 않는다) 여기서도 갈라줘야 크래시 로그가 엉뚱한 폴더로 가지 않는다.
+#[cfg(feature = "online")]
+pub const APP_IDENTIFIER: &str = "com.anything.app";
+#[cfg(not(feature = "online"))]
+pub const APP_IDENTIFIER: &str = "com.anything.lite";
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager};
+use tauri_plugin_autostart::MacosLauncher;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// 로깅 초기화 (파일 + 콘솔)
+///
+/// app_data_dir이 Some이면 파일 로깅도 활성화.
+/// None이면 콘솔만 (app_data_dir 확보 실패 시 fallback).
+/// 네이티브 드래그아웃 프리뷰 아이콘 경로 — 내장 PNG 를 앱 캐시에 1회 기록하고 절대경로 반환.
+/// @crabnebula/tauri-plugin-drag 의 startDrag(icon) 는 디스크상 실존 이미지 경로를 요구한다.
+#[tauri::command]
+fn drag_preview_icon(app: tauri::AppHandle) -> Result<String, String> {
+    use std::io::Write;
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("cache dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create cache dir: {e}"))?;
+    let path = dir.join("drag-preview.png");
+    if !path.exists() {
+        let bytes = include_bytes!("../icons/32x32.png");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(bytes))
+            .map_err(|e| format!("write drag icon: {e}"))?;
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn init_logging(app_data_dir: Option<&PathBuf>) {
+    // 기본 필터: 릴리즈에서는 info, 디버그에서는 debug
+    let default_filter = if cfg!(debug_assertions) {
+        "docufinder=debug,tauri=info"
+    } else {
+        "docufinder=info,tauri=warn"
+    };
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
+    // 콘솔 출력 레이어
+    let stdout_layer = fmt::layer()
+        .with_target(true)
+        .with_level(true)
+        .with_thread_ids(false);
+
+    // 파일 로깅 (app_data_dir이 있는 경우에만)
+    if let Some(data_dir) = app_data_dir {
+        let logs_dir = data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+
+        match RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_prefix("docufinder")
+            .filename_suffix("log")
+            .max_log_files(7) // 7일분만 보존, C: 누적 방지
+            .build(&logs_dir)
+        {
+            Ok(file_appender) => {
+                let file_layer = fmt::layer()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_level(true)
+                    .with_writer(file_appender);
+
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(stdout_layer)
+                    .with(file_layer)
+                    .init();
+
+                tracing::info!("Logging initialized. Log dir: {:?}", logs_dir);
+            }
+            Err(e) => {
+                // 파일 로그 생성 실패 시 콘솔 전용으로 fallback (앱 시작은 보장)
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(stdout_layer)
+                    .init();
+
+                tracing::warn!("File logging disabled ({}), using console only", e);
+            }
+        }
+    } else {
+        // 콘솔만
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .init();
+    }
+}
+
+/// 모델 파일이 없으면 비동기 자동 다운로드 시작
+#[cfg(feature = "online")]
+fn maybe_download_models(
+    app_handle: tauri::AppHandle,
+    models_dir: PathBuf,
+    semantic_enabled: bool,
+) {
+    let e5_model_int8 = models_dir
+        .join("kosimcse-roberta-multitask")
+        .join("model_int8.onnx");
+    let e5_model = models_dir
+        .join("kosimcse-roberta-multitask")
+        .join("model.onnx");
+    let e5_model_data = models_dir
+        .join("kosimcse-roberta-multitask")
+        .join("model.onnx.data");
+    let e5_tokenizer = models_dir
+        .join("kosimcse-roberta-multitask")
+        .join("tokenizer.json");
+    let embedder_available = (e5_model_int8.exists()
+        || (e5_model.exists() && e5_model_data.exists()))
+        && e5_tokenizer.exists();
+    if !semantic_enabled || embedder_available {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        tracing::info!("모델 파일이 없습니다. 백그라운드 다운로드를 시작합니다...");
+        let _ = app_handle.emit("model-download-status", "downloading");
+
+        match tokio::task::spawn_blocking(move || model_downloader::ensure_models(&models_dir))
+            .await
+        {
+            Ok(Ok(result)) => {
+                let any_downloaded = result.onnx_runtime_downloaded
+                    || result.model_downloaded
+                    || result.model_data_downloaded
+                    || result.tokenizer_downloaded;
+
+                if any_downloaded {
+                    tracing::info!(
+                        "모델 다운로드 완료: ONNX Runtime={}, Model={}, ModelData={}, Tokenizer={}",
+                        result.onnx_runtime_downloaded,
+                        result.model_downloaded,
+                        result.model_data_downloaded,
+                        result.tokenizer_downloaded,
+                    );
+                }
+                let _ = app_handle.emit("model-download-status", "completed");
+            }
+            Ok(Err(e)) => {
+                tracing::error!("모델 다운로드 실패: {}. 일부 기능이 비활성화됩니다.", e);
+                let _ = app_handle.emit("model-download-status", "failed");
+            }
+            Err(e) => {
+                tracing::error!("모델 다운로드 태스크 실패: {}", e);
+                let _ = app_handle.emit("model-download-status", "failed");
+            }
+        }
+    });
+}
+
+/// OCR 모델 파일이 없으면 비동기 자동 다운로드 시작
+#[cfg(feature = "online")]
+fn maybe_download_ocr_models(app_handle: tauri::AppHandle, models_dir: PathBuf, ocr_enabled: bool) {
+    if !ocr_enabled {
+        return;
+    }
+
+    let ocr_dir = models_dir.join("paddleocr");
+    let det_exists = ocr_dir.join("det.onnx").exists();
+    let rec_exists = ocr_dir.join("rec.onnx").exists();
+    let dict_exists = ocr_dir.join("dict.txt").exists();
+
+    if det_exists && rec_exists && dict_exists {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        tracing::info!("OCR 모델 파일이 없습니다. 백그라운드 다운로드를 시작합니다...");
+        let _ = app_handle.emit("model-download-status", "downloading-ocr");
+
+        match tokio::task::spawn_blocking(move || model_downloader::ensure_ocr_models(&models_dir))
+            .await
+        {
+            Ok(Ok((det, rec, dict))) => {
+                if det || rec || dict {
+                    tracing::info!(
+                        "OCR 모델 다운로드 완료: det={}, rec={}, dict={}",
+                        det,
+                        rec,
+                        dict
+                    );
+                }
+                let _ = app_handle.emit("model-download-status", "completed-ocr");
+            }
+            Ok(Err(e)) => {
+                tracing::error!("OCR 모델 다운로드 실패: {}", e);
+                let _ = app_handle.emit("model-download-status", "failed-ocr");
+            }
+            Err(e) => {
+                tracing::error!("OCR 모델 다운로드 태스크 실패: {}", e);
+                let _ = app_handle.emit("model-download-status", "failed-ocr");
+            }
+        }
+    });
+}
+
+/// 기존 감시 폴더들 자동 감시 복원 (콜백에서 사용)
+fn resume_watchers(container: &AppContainer) {
+    if let Ok(conn) = db::get_connection(&container.db_path) {
+        if let Ok(folders) = db::get_watched_folders(&conn) {
+            let existing_folders: Vec<String> = folders
+                .into_iter()
+                .filter(|folder| std::path::Path::new(folder).exists())
+                .collect();
+            if !existing_folders.is_empty() {
+                if let Ok(wm) = container.get_watch_manager() {
+                    if let Ok(mut wm) = wm.write() {
+                        wm.resume_with_folders(&existing_folders);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 벡터 인덱스 파일 ↔ DB 정합성 검증
+///
+/// get_vector_indexing_stats 의 chunks JOIN files COUNT 풀스캔이 HDD 대용량 DB에서
+/// 수 초 걸릴 수 있어 setup() 에서는 백그라운드 스레드로 호출한다 (quick_check 와 동일 패턴).
+/// 벡터 검색은 lazy 초기화라 검증/복구(reset_all_vector_indexed)가 수 초 늦게 끝나도 무해.
+fn validate_vector_index(
+    vector_index_path: &std::path::Path,
+    db_path: &std::path::Path,
+    semantic_available: bool,
+) {
+    let vector_file = vector_index_path;
+    let map_file = vector_index_path.with_extension("map");
+    let vector_file_exists = vector_file.exists();
+    let map_file_exists = map_file.exists();
+
+    tracing::info!(
+        "[VectorValidate] usearch={} ({}), map={} ({})",
+        vector_file_exists,
+        vector_file.display(),
+        map_file_exists,
+        map_file.display(),
+    );
+
+    if semantic_available {
+        if let Ok(conn) = db::get_connection(db_path) {
+            if let Ok(stats) = db::get_vector_indexing_stats(&conn) {
+                tracing::info!(
+                    "[VectorValidate] DB: total={}, vector_indexed={}, pending_chunks={}",
+                    stats.total_files,
+                    stats.vector_indexed_files,
+                    stats.pending_chunks
+                );
+                if stats.vector_indexed_files > 0 && (!vector_file_exists || !map_file_exists) {
+                    tracing::warn!(
+                        "[VectorValidate] Index file missing → resetting {} files in DB",
+                        stats.vector_indexed_files
+                    );
+                    if let Ok(reset_count) = db::reset_all_vector_indexed(&conn) {
+                        tracing::info!(
+                            "[VectorValidate] Reset vector_indexed_at for {} files",
+                            reset_count
+                        );
+                    }
+                } else if vector_file_exists && map_file_exists {
+                    tracing::info!("[VectorValidate] Both files present — no reset needed");
+                }
+            }
+        }
+    }
+}
+
+// spawn_startup_sync は initialize_app → spawn_startup_sync_async (index.rs) に統合済み。
+// lib.rs setup() での二重呼び出しを防止するために削除。
+
+/// 벡터 워커 정리 + 인덱스 저장 + DB 최적화 (종료/트레이 quit 공통)
+fn cleanup_vector_resources(container: &AppContainer) {
+    // FTS 파이프라인 즉시 취소 신호 (인덱싱 중 종료 시 스레드가 빠르게 탈출하도록)
+    container.cancel_indexing();
+    // 주기 sync task 중단 신호 (v2.5.2) — 루프가 최대 60초 내 탈출
+    container.signal_sync_shutdown();
+
+    let vector_worker = container.get_vector_worker();
+    if let Ok(mut worker) = vector_worker.write() {
+        if worker.is_running() {
+            tracing::info!("Stopping vector worker...");
+            worker.cancel();
+            worker.join();
+        }
+    }
+    if let Ok(vi) = container.get_vector_index() {
+        if let Err(e) = vi.save() {
+            tracing::error!("Failed to save vector index: {}", e);
+        }
+    }
+    // DB 최적화: WAL 체크포인트 + 쿼리 플래너 통계 갱신
+    cleanup_database(&container.db_path);
+}
+
+/// 앱 종료 절차 (트레이 quit + 창 닫기 공통):
+/// 즉시 취소 신호 → cleanup 교착 대비 3초 watchdog → 벡터 리소스 정리 → 프로세스 종료
+fn graceful_shutdown(app: &tauri::AppHandle) {
+    // 즉시 취소 신호 (인덱싱 스레드가 최대한 빨리 탈출하도록)
+    if let Some(container) = app.try_state::<RwLock<AppContainer>>() {
+        if let Ok(container) = container.read() {
+            container.cancel_indexing();
+            container.signal_sync_shutdown();
+            if let Ok(worker) = container.get_vector_worker().read() {
+                worker.cancel();
+            }
+        }
+    }
+    // Watchdog: cleanup 교착 시 3초 후 강제 종료 (인덱싱 중 종료 안 되는 버그 방지)
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        tracing::warn!("Cleanup timeout — forcing process exit");
+        std::process::exit(0);
+    });
+    // 정상 cleanup 시도
+    if let Some(container) = app.try_state::<RwLock<AppContainer>>() {
+        if let Ok(container) = container.read() {
+            cleanup_vector_resources(&container);
+        }
+    }
+    app.exit(0);
+}
+
+/// 모델 디렉토리 내 .tmp 잔여 파일 정리 (다운로드 중 크래시 시 생성됨)
+#[cfg(feature = "online")]
+fn cleanup_tmp_files(models_dir: &std::path::Path) {
+    let mut cleaned = 0usize;
+    // models/ 하위 2단계까지 탐색 (e.g., models/kosimcse-roberta-multitask/*.tmp)
+    for entry in std::fs::read_dir(models_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            if std::fs::remove_file(&path).is_ok() {
+                cleaned += 1;
+            }
+        } else if path.is_dir() {
+            for sub in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                let sub_path = sub.path();
+                if sub_path.is_file()
+                    && sub_path.extension().and_then(|e| e.to_str()) == Some("tmp")
+                    && std::fs::remove_file(&sub_path).is_ok()
+                {
+                    cleaned += 1;
+                }
+            }
+        }
+    }
+    if cleaned > 0 {
+        tracing::info!("Cleaned up {} stale .tmp model file(s)", cleaned);
+    }
+}
+
+/// FTS5 세그먼트 점진 병합 (종료 시 시간 예산 내 실행)
+///
+/// 증분 인덱싱이 누적되면 automerge 기본값만으로는 작은 b-tree 세그먼트가 늘어나
+/// MATCH doclist 병합 비용이 점진적으로 증가한다 (prefix 와일드카드 쿼리 특히 민감).
+/// 전체 `'optimize'` 는 단일 트랜잭션이라 대용량 DB에서 graceful_shutdown 의 3초
+/// watchdog 을 초과해 통째로 롤백될 수 있으므로, FTS5 문서의 'merge=N' 점진 병합
+/// 패턴을 사용한다 — 회당 자체 트랜잭션으로 커밋되어 중단돼도 진행분이 보존되고,
+/// 남은 병합은 다음 종료 시 이어서 진행된다.
+fn merge_fts_segments(conn: &rusqlite::Connection) {
+    const MERGE_UNITS: i64 = 64;
+    const TIME_BUDGET_MS: u128 = 500; // watchdog 3초 내 체크포인트 시간 확보
+
+    // 음수 파라미터 = 모든 세그먼트를 대상으로 새 병합 사이클 시작
+    if let Err(e) = conn.execute(
+        "INSERT INTO chunks_fts(chunks_fts, rank) VALUES('merge', ?1)",
+        [-MERGE_UNITS],
+    ) {
+        tracing::warn!("FTS5 segment merge start failed: {}", e);
+        return;
+    }
+    let start = std::time::Instant::now();
+    let mut rounds = 0usize;
+    while start.elapsed().as_millis() < TIME_BUDGET_MS {
+        let before: i64 = conn
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap_or(0);
+        if conn
+            .execute(
+                "INSERT INTO chunks_fts(chunks_fts, rank) VALUES('merge', ?1)",
+                [MERGE_UNITS],
+            )
+            .is_err()
+        {
+            return;
+        }
+        rounds += 1;
+        let after: i64 = conn
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap_or(0);
+        // FTS5 문서: 'merge' 양수 호출의 total_changes 증가가 2 미만이면 병합할 작업 없음
+        if after - before < 2 {
+            tracing::info!("FTS5 segment merge complete ({} rounds)", rounds);
+            return;
+        }
+    }
+    tracing::info!(
+        "FTS5 segment merge: time budget reached ({} rounds, 다음 종료 시 계속)",
+        rounds
+    );
+}
+
+/// 앱 종료 시 DB 정리: 풀 drain → FTS 세그먼트 병합 → WAL 체크포인트 + PRAGMA optimize
+fn cleanup_database(db_path: &std::path::Path) {
+    // 풀의 모든 커넥션을 먼저 닫아야 WAL 체크포인트가 완전히 적용됨
+    // (풀 커넥션이 WAL read lock을 보유하면 TRUNCATE 모드 체크포인트 실패)
+    crate::db::pool::drain_pool();
+
+    if let Ok(conn) = crate::db::get_connection(db_path) {
+        // FTS5 세그먼트 병합 — WAL 체크포인트 전에 실행해 병합분이 본 DB 파일에 흡수되게 함
+        merge_fts_segments(&conn);
+
+        match conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA optimize;
+             PRAGMA incremental_vacuum;",
+        ) {
+            Ok(_) => tracing::info!(
+                "DB cleanup completed (WAL checkpoint + optimize + incremental vacuum)"
+            ),
+            Err(e) => tracing::warn!("DB cleanup partial failure: {}", e),
+        }
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    // 크래시 핸들러 설정 (패닉 발생 시 로그 기록)
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // 파서 라이브러리의 알려진 패닉은 catch_unwind로 처리됨 → crash.log 오염 방지.
+        // 해당 파일은 에러로 스킵되고 앱은 정상 동작하므로 crash 기록 불필요.
+        // 패턴은 `panic_filter` 모듈에서 공유 — deferred flush(telemetry) 에서도 같은 필터 사용.
+        if crate::panic_filter::is_benign_location(&location) {
+            return;
+        }
+
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+
+        // 처리 중이던 파일/단계 (있으면 메시지 끝에 덧붙임 — 향후 디버깅에 결정적)
+        let breadcrumb_line = crate::breadcrumb::snapshot()
+            .as_ref()
+            .map(crate::breadcrumb::format_for_log);
+
+        eprintln!("╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║                    CRITICAL ERROR                        ║");
+        eprintln!("╚══════════════════════════════════════════════════════════╝");
+        eprintln!("Location: {}", location);
+        eprintln!("Message: {}", message);
+        if let Some(bc) = &breadcrumb_line {
+            eprintln!("{}", bc);
+        }
+        eprintln!("Please contact the development team to report this issue.");
+
+        // Telegram 자동 전송 (빌드 시 토큰 주입 + 사용자의 error_reporting_enabled
+        // 양쪽을 통과할 때만 — report_panic_sync 내부에서 검사한다).
+        let telegram_msg = match &breadcrumb_line {
+            Some(bc) => format!("{message} | {bc}"),
+            None => message.clone(),
+        };
+        crate::commands::telemetry::report_panic_sync(&location, &telegram_msg);
+
+        // 긴급 로그 flush — 날짜 기반 로테이션 (최대 3개 파일 유지)
+        if let Some(data_dir) = dirs::data_dir() {
+            let crash_dir = data_dir.join(crate::APP_IDENTIFIER);
+            let _ = std::fs::create_dir_all(&crash_dir);
+
+            // 날짜별 crash log 파일
+            let today = chrono::Local::now().format("%Y-%m-%d");
+            let crash_log = crash_dir.join(format!("crash-{}.log", today));
+
+            // 오래된 crash log 정리 (최대 3개 유지)
+            const MAX_CRASH_LOGS: usize = 3;
+            if let Ok(entries) = std::fs::read_dir(&crash_dir) {
+                let mut crash_files: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
+                    .collect();
+                crash_files.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+                for old_file in crash_files.into_iter().skip(MAX_CRASH_LOGS) {
+                    let _ = std::fs::remove_file(old_file.path());
+                }
+            }
+
+            // 단일 파일 크기 제한 (1MB)
+            const MAX_CRASH_LOG_SIZE: u64 = 1024 * 1024;
+            if let Ok(meta) = std::fs::metadata(&crash_log) {
+                if meta.len() > MAX_CRASH_LOG_SIZE {
+                    let _ = std::fs::remove_file(&crash_log);
+                }
+            }
+
+            let entry = match &breadcrumb_line {
+                Some(bc) => format!(
+                    "[{}] PANIC at {}: {}\n  {}\n",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    location,
+                    message,
+                    bc
+                ),
+                None => format!(
+                    "[{}] PANIC at {}: {}\n",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    location,
+                    message
+                ),
+            };
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&crash_log)
+            {
+                let _ = file.write_all(entry.as_bytes());
+                let _ = file.sync_all(); // 전원 차단 시 유실 방지
+            }
+        }
+    }));
+
+    // tokenizers 병렬 처리 비활성화 (rayon과의 데드락 방지)
+    // SAFETY: run() 진입 직후, main 스레드만 존재하는 단일 스레드 컨텍스트.
+    // tauri::Builder 생성 전이므로 다른 스레드가 환경변수를 읽을 수 없음.
+    // Rust 1.81+ deprecated이나 프로세스 초기화 시점이므로 안전함.
+    unsafe { std::env::set_var("TOKENIZERS_PARALLELISM", "false") };
+
+    // visible: false → page load 완료 후 창 표시 (검정화면 방지)
+    // Dev mode: WebView2 SmartScreen 비활성화는 package.json tauri:dev 스크립트에서 설정
+    let show_on_load = Arc::new(AtomicBool::new(true));
+    let show_on_load_flag = show_on_load.clone();
+
+    let builder = tauri::Builder::default()
+        // 싱글 인스턴스: 중복 실행 시 기존 창 포커스 (가장 먼저 등록해야 함)
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_dialog::init());
+
+    // 자동 업데이트 — lite(내부망) 빌드는 등록하지 않는다.
+    // `dialog:false` + `installMode:passive` 로 서명 없는 설치본을 받아 조용히 실행하는 흐름은
+    // 보안솔루션이 dropper 휴리스틱으로 잡는 대표 동작이고, 폐쇄망에서는 6시간마다 실패하는
+    // 아웃바운드 시도가 IDS 로그에 반복 알람으로 쌓이기만 한다.
+    #[cfg(feature = "online")]
+    let builder = builder
+        // 자동 업데이트 (GitHub Releases + ed25519 서명 검증)
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // relaunch() 지원 — updater가 설치 완료 후 앱 재시작
+        .plugin(tauri_plugin_process::init());
+
+    builder
+        // 네이티브 드래그아웃 — 검색 결과 파일을 다른 앱/웹페이지로 끌어다 놓기
+        .plugin(tauri_plugin_drag::init())
+        // tauri-plugin-fs: 프론트엔드에서 미사용 (capabilities 미부여)
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                // VISIBLE 복원 제외: start_minimized 설정을 무시하고 창을 띄우는 문제 방지
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        & !tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
+        .setup(move |app| {
+            // Initialize app data directory
+            // 로깅 초기화를 위해 먼저 시도하되, 실패해도 콘솔 로깅은 확보
+            let app_data_dir = match app.path().app_data_dir() {
+                Ok(dir) => {
+                    std::fs::create_dir_all(&dir)
+                        .map_err(|e| format!("Failed to create app data dir: {}", e))?;
+                    // 로깅 초기화 (콘솔 + 파일)
+                    init_logging(Some(&dir));
+                    dir
+                }
+                Err(e) => {
+                    // app_data_dir 실패 시 콘솔 전용 로깅으로 fallback
+                    init_logging(None);
+                    tracing::error!("Failed to get app data dir: {}", e);
+                    return Err(format!("Failed to get app data dir: {}", e).into());
+                }
+            };
+
+            // [v2.6.3] main window 직접 build.
+            // conf.json 의 main window 는 `create:false` 라 Tauri 가 자동 생성하지 않는다.
+            // Windows 에서 `<exe_dir>/EBWebView` 또는 `<exe_dir>/*/EBWebView` 가 발견되면
+            // 그 경로로 `ICoreWebView2Environment` 를 만들어 `with_environment` 로 주입한다.
+            // registry 에 WebView2 가 등록 안 된 환경(LTSC 1809 / GPO 차단 / 다른 사용자 계정에만
+            // 설치된 케이스 — 이슈 #24)에서도 EBWebView 폴더만 풀어두면 동작.
+            {
+                let main_config = app
+                    .config()
+                    .app
+                    .windows
+                    .iter()
+                    .find(|w| w.label == "main")
+                    .cloned()
+                    .ok_or_else(|| {
+                        "main window config missing in tauri.conf.json".to_string()
+                    })?;
+
+                #[allow(unused_mut)]
+                let mut builder = tauri::WebviewWindowBuilder::from_config(
+                    app.handle(),
+                    &main_config,
+                )
+                .map_err(|e| format!("WebviewWindowBuilder::from_config failed: {e}"))?;
+
+                // Windows: LTSC installer 에 fixed-runtime 폴더가 있어도 시스템
+                // WebView2 Runtime 이 정상 등록된 PC에서는 시스템 런타임을 우선 사용한다.
+                // 집 PC에서 v2.6.1/2.6.2 가 됐다가 LTSC 설치본에서만 실패한 이유가 이
+                // 차이다. 시스템 런타임이 없거나 강제 플래그가 있을 때만 직접 만든
+                // ICoreWebView2Environment 를 with_environment 로 wry 에 주입한다.
+                //
+                // Tauri 의 `webviewInstallMode:fixedRuntime` 는 프로세스 시작 전
+                // WEBVIEW2_BROWSER_EXECUTABLE_FOLDER 를 설정하지만, 설정 경로가
+                // webview2-runtime/ 부모 폴더라 현재 CAB 레이아웃의 실제
+                // msedgewebview2.exe 위치(EBWebView/x64)와 맞지 않는다. 그래서
+                // fixed-runtime fallback 에서는 런타임 경로와 UDF를 직접 지정한다.
+                //
+                // LTSC installer 의 풀린 위치 `<exe_dir>/webview2-runtime/EBWebView/x64/`
+                // 는 detect_fixed_runtime_dir 의 우선순위 1 후보로 등록되어 있다.
+                // v2.6.17: Windows 10 + Fixed Version Runtime v120+ 는 renderer 가
+                // App Container sandbox 에서 실행되므로 runtime 폴더에 App Container
+                // 읽기 권한이 필수다 (이슈 #23). NSIS 가 푼 폴더엔 없으므로 startup
+                // 에서 보강한다.
+                //
+                // v2.6.18: watchdog 다이얼로그 본문을 fixed runtime 감지 여부로 분기.
+                // 미감지(일반 설치본 + system WebView2)면 LTSC 설치본 안내가 우선이고,
+                // 감지(LTSC 설치본, runtime 정상)인데도 hang 이면 보안 솔루션 차단이
+                // 유력하다 — 두 경우를 같은 문구로 묶으면 원인을 오도한다 (이슈 #23/#24).
+                #[cfg(target_os = "windows")]
+                let webview2_watchdog_body: String = {
+                    if let Some(runtime_dir) =
+                        crate::webview2_runtime::detect_fixed_runtime_dir()
+                    {
+                        let force_fixed =
+                            std::env::var_os("DOCUFINDER_FORCE_FIXED_WEBVIEW2").is_some();
+                        let fixed_version =
+                            crate::webview2_runtime::fixed_runtime_version(&runtime_dir);
+                        let system_status = if force_fixed {
+                            Err("DOCUFINDER_FORCE_FIXED_WEBVIEW2=1".to_string())
+                        } else {
+                            crate::webview2_runtime::detect_system_runtime_version_ignoring_overrides()
+                        };
+
+                        let system_version_to_use = match &system_status {
+                            Ok(version)
+                                if crate::webview2_runtime::should_prefer_system_runtime(
+                                    version,
+                                    fixed_version.as_deref(),
+                                ) =>
+                            {
+                                Some(version.clone())
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(version) = system_version_to_use {
+                            {
+                                crate::webview2_runtime::clear_process_overrides();
+                                let override_after =
+                                    crate::webview2_runtime::process_override_diagnostics();
+                                tracing::info!(
+                                    "System WebView2 Runtime available ({version}) and newer than bundled fixed runtime ({}) — using system runtime instead of bundled fixed runtime at {}",
+                                    fixed_version.as_deref().unwrap_or("unknown"),
+                                    runtime_dir.display(),
+                                );
+                                tracing::info!(
+                                    "WebView2 process override after system runtime selection:\n{override_after}"
+                                );
+
+                                format!(
+                                    "WebView2 초기화가 응답하지 않습니다.\n\n\
+                                     시스템 WebView2 Runtime({version})이 정상 등록되어 있어\n\
+                                     LTSC 포함 런타임 대신 시스템 런타임으로 시작했습니다.\n\
+                                     그래도 controller 생성이 끝나지 않았으므로 WebView2\n\
+                                     프로세스 생성/프로필 쓰기/보안 정책 쪽을 확인해야 합니다.\n\n\
+                                     [진단 정보]\nSystem WebView2 Runtime: {version}\n\
+                                     Bundled fixed runtime: {}\n\
+                                     Process overrides:\n{override_after}\n\n\
+                                     위 내용을 캡처해 개발자에게 전달해 주세요. 앱을 종료합니다.",
+                                    runtime_dir.display()
+                                )
+                            }
+                        } else {
+                            {
+                                let system_reason = match system_status {
+                                    Ok(version) => format!(
+                                        "System WebView2 Runtime available ({version}) but not newer than bundled fixed runtime ({})",
+                                        fixed_version.as_deref().unwrap_or("unknown")
+                                    ),
+                                    Err(reason) => reason,
+                                };
+
+                                if force_fixed {
+                                    tracing::info!(
+                                        "System WebView2 Runtime bypassed ({system_reason}) — using bundled fixed runtime at {}",
+                                        runtime_dir.display()
+                                    );
+                                } else if system_reason.contains("not newer than bundled") {
+                                    tracing::info!(
+                                        "{system_reason} — using bundled fixed runtime at {}",
+                                        runtime_dir.display()
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "System WebView2 Runtime unavailable ({system_reason}) — using bundled fixed runtime at {}",
+                                        runtime_dir.display()
+                                    );
+                                }
+
+                                let webview2_user_data_dir = match app.path().app_local_data_dir() {
+                                    Ok(dir) => dir.join("webview2-user-data"),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "app_local_data_dir 확보 실패, app_data_dir로 fallback: {e}"
+                                        );
+                                        app_data_dir.join("webview2-user-data")
+                                    }
+                                };
+                                let udf_ok = crate::webview2_runtime::prepare_user_data_dir(
+                                    &webview2_user_data_dir,
+                                );
+                                builder = builder.data_directory(webview2_user_data_dir.clone());
+
+                                let override_before =
+                                    crate::webview2_runtime::process_override_diagnostics();
+                                crate::webview2_runtime::force_process_overrides(
+                                    &runtime_dir,
+                                    &webview2_user_data_dir,
+                                );
+                                let override_after =
+                                    crate::webview2_runtime::process_override_diagnostics();
+                                tracing::info!(
+                                    "WebView2 process override before:\n{override_before}\nWebView2 process override after:\n{override_after}"
+                                );
+
+                                let runtime_acl_ok =
+                                    crate::webview2_runtime::grant_app_container_access(
+                                        &runtime_dir,
+                                    );
+                                let runtime_diag =
+                                    crate::webview2_runtime::runtime_diagnostics(&runtime_dir);
+                                let udf_diag = crate::webview2_runtime::user_data_diagnostics(
+                                    &webview2_user_data_dir,
+                                );
+                                tracing::info!("WebView2 fixed runtime 진단:\n{runtime_diag}");
+                                tracing::info!("WebView2 user data dir 진단:\n{udf_diag}");
+
+                                let mut env_injected = false;
+                                match crate::webview2_runtime::create_environment(
+                                    &runtime_dir,
+                                    &webview2_user_data_dir,
+                                ) {
+                                    Ok(env) => {
+                                        tracing::info!(
+                                            "WebView2 fixed runtime detected at {} — environment injected",
+                                            runtime_dir.display()
+                                        );
+                                        builder = builder.with_environment(env);
+                                        env_injected = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "WebView2 fixed runtime present at {} but environment creation failed: {}",
+                                            runtime_dir.display(),
+                                            e
+                                        );
+                                        if !force_fixed {
+                                            crate::webview2_runtime::clear_process_overrides();
+                                        }
+                                    }
+                                }
+
+                                // fixed runtime 정상 감지 — hang 이면 controller 생성 단계에서
+                                // msedgewebview2 자식 프로세스 실행, runtime 읽기 또는 UDF
+                                // 쓰기가 막힌 상태다.
+                                format!(
+                                    "WebView2 초기화가 응답하지 않습니다.\n\n\
+                                     LTSC 포함 런타임으로 시작했습니다. 시스템 WebView2가\n\
+                                     없거나, 포함 런타임보다 새 버전이 아니라서 이 경로를\n\
+                                     선택했습니다. 포함 런타임과 User Data Folder 권한을\n\
+                                     보강했지만 controller 생성 단계가 끝나지 않았습니다.\n\
+                                     Windows Defender 차단 기록, AppLocker, EDR, Controlled\n\
+                                     Folder Access 또는 App Container 권한 문제를 확인해야 합니다.\n\
+                                     아래 실행 파일을 허용 목록에 추가해 주세요:\n\
+                                     - docufinder.exe\n\
+                                     - msedgewebview2.exe (WebView2 브라우저 프로세스)\n\n\
+                                     [진단 정보]\nSystem WebView2 Runtime: {system_reason}\n\
+                                     Fixed environment injected: {env_injected}\n\
+                                     Runtime ACL: {}\nUDF ACL: {}\n\
+                                     {runtime_diag}\n\n{udf_diag}\n\
+                                     Process overrides:\n{override_after}\n\n\
+                                     위 내용을 캡처해 개발자에게 전달해 주세요. 앱을 종료합니다.",
+                                    if runtime_acl_ok { "OK" } else { "FAILED" },
+                                    if udf_ok { "OK" } else { "FAILED" }
+                                )
+                            }
+                        }
+                    } else {
+                        crate::webview2_runtime::clear_process_overrides();
+                        let override_after =
+                            crate::webview2_runtime::process_override_diagnostics();
+                        tracing::info!(
+                            "no fixed-runtime detected near exe — relying on system WebView2 (registry detection)"
+                        );
+                        // fixed runtime 미감지 = 일반 설치본. system WebView2 의존.
+                        // 회사 / 오프라인 PC 면 LTSC 설치본이 맞다.
+                        format!(
+                            "WebView2 초기화가 응답하지 않습니다.\n\n\
+                             이 설치본은 WebView2 런타임을 자체 포함하지 않아 시스템에 깔린\n\
+                             WebView2 에 의존합니다. 회사 / 관공서 / 오프라인 PC 에서 화면이\n\
+                             안 뜨면, 릴리스 페이지에서 파일명에 'ltsc' 가 붙은 설치본\n\
+                             (Finder_x.x.x_x64-ltsc-setup.exe — WebView2 를 자체 포함한\n\
+                             오프라인 전용 빌드) 을 받아 다시 설치해 주세요.\n\n\
+                             [진단 정보] fixed runtime 미감지 — system WebView2 경로\n\
+                             Process overrides:\n{override_after}\n\n\
+                             위 내용을 캡처해 개발자에게 전달해 주세요. 앱을 종료합니다."
+                        )
+                    }
+                };
+
+                // builder.build() 는 wry 가 WebView2 controller 를 생성하는 단계로,
+                // controller 완료 callback 무한 대기(wait_with_pump)로 hang 할 수 있다
+                // (이슈 #23 v2.6.16). watchdog 으로 60초 후 진단 다이얼로그 + 종료.
+                #[cfg(target_os = "windows")]
+                let build_watchdog = crate::webview2_runtime::spawn_build_watchdog(
+                    std::time::Duration::from_secs(60),
+                    webview2_watchdog_body,
+                );
+
+                let build_result = builder.build();
+
+                #[cfg(target_os = "windows")]
+                build_watchdog.disarm();
+
+                build_result.map_err(|e| format!("main window build failed: {e}"))?;
+            }
+
+            // Create models directory
+            let models_dir = app_data_dir.join("models");
+            std::fs::create_dir_all(&models_dir).ok();
+
+            // 이전 다운로드 중 크래시로 남은 .tmp 파일 정리
+            #[cfg(feature = "online")]
+            cleanup_tmp_files(&models_dir);
+
+            #[cfg_attr(not(feature = "online"), allow(unused_variables))]
+            let resource_dir = app.path().resource_dir().ok();
+
+            // macOS: ad-hoc 서명 + dmg 다운로드 시 .app 내부 sub-binary(node, *.node, dylib)에
+            // `com.apple.quarantine` xattr 가 상속되어 spawn 시 Gatekeeper 가 차단 → kordoc CLI
+            // 가 실행 안 됨 → HWP5 파싱 전수 실패(이슈 #22). 사용자가 직접 `xattr -dr` 하기 전엔
+            // 발현되므로 startup 1회로 자동 제거한다. xattr 실행 자체는 quarantine 영향 안 받음.
+            // sync 유지 — 아래 kordoc::is_available 진단이 quarantine 제거 후에 실행돼야 한다.
+            #[cfg(target_os = "macos")]
+            if let Some(resource_dir) = resource_dir.as_ref() {
+                let sidecar_root = resource_dir.join("resources");
+                if sidecar_root.exists() {
+                    match std::process::Command::new("/usr/bin/xattr")
+                        .args(["-rd", "com.apple.quarantine"])
+                        .arg(&sidecar_root)
+                        .output()
+                    {
+                        Ok(out) if out.status.success() => {
+                            tracing::info!(
+                                "macOS 사이드카 quarantine 제거: {}",
+                                sidecar_root.display()
+                            );
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            tracing::warn!("xattr 종료코드 {}: {}", out.status, stderr.trim());
+                        }
+                        Err(e) => tracing::warn!("xattr 실행 실패: {}", e),
+                    }
+                }
+            }
+
+            // ORT_DYLIB_PATH 설정: 단일 스레드(setup) 시점에서 환경변수 설정
+            // (아래 모델 준비 스레드 spawn 전에 실행 — set_var 단일 스레드 안전 논거 유지)
+            // container.rs OnceCell 내부(멀티스레드 가능)에서 호출하던 것을 여기로 이동
+            // SAFETY: setup()은 main 스레드에서 실행되며, ort 라이브러리 초기화 전임.
+            // Rust 1.81+ deprecated이나 프로세스 초기화 시점이므로 안전함.
+            // DLL(onnxruntime·pdfium) 은 **번들(설치본) 경로가 있으면 거기서 직접 로드**한다.
+            // AppData 복사본을 로드하면 내부망 EDR(ZombieZERO 등) 이 "이 프로세스가 런타임에 쓴
+            // PE 를 로드" 하는 상관을 dropper 로 오탐해 프로세스를 격리한다(이슈 #35). 설치
+            // 프로그램이 놓은 서명된 번들 파일에서 로드하면 그 상관이 끊겨 오탐이 사라진다.
+            // 번들이 없으면(dev·미번들 플랫폼) 기존 AppData seed/다운로드 경로로 fallback.
+            //
+            // lite(내부망) 빌드는 onnxruntime/pdfium 을 아예 번들하지 않고 시맨틱·OCR 도
+            // 강제 off 라, 두 경로를 설정할 일이 없다. 설정하지 않으면 `ort`/`pdfium-render`
+            // 가 dlopen 을 시도하는 순간 자체가 사라져 "런타임 DLL 로드" 신호가 0 이 된다.
+            #[cfg(feature = "online")]
+            {
+                let ort_lib = model_downloader::dylib_filename();
+                let bundled_ort = resource_dir
+                    .as_ref()
+                    .map(|r| r.join("resources").join("onnxruntime").join(ort_lib));
+                let dll_path = match bundled_ort {
+                    Some(p) if p.exists() => p,
+                    _ => models_dir
+                        .join("kosimcse-roberta-multitask")
+                        .join(ort_lib),
+                };
+                unsafe { std::env::set_var("ORT_DYLIB_PATH", &dll_path) };
+                tracing::info!("ORT_DYLIB_PATH set to {:?}", dll_path);
+            }
+
+            // PDFIUM_DYLIB_PATH 설정: 스캔/이미지 PDF 페이지 래스터화 fallback 용 (parsers/pdf.rs).
+            // ORT_DYLIB_PATH 와 동일하게 번들 경로 우선, 없으면 models/pdfium/<lib> fallback.
+            // 외부에서 이미 명시 설정돼 있으면 그 값을 존중한다. 파일이 없으면 pdf.rs 가 조용히
+            // 기능 비활성한다(크래시 없음 — 기존 born-digital/JPEG 스캔 경로는 그대로 동작).
+            #[cfg(feature = "online")]
+            if std::env::var_os("PDFIUM_DYLIB_PATH").is_none() {
+                let pdfium_lib = model_downloader::pdfium_lib_filename();
+                let bundled_pdfium = resource_dir
+                    .as_ref()
+                    .map(|r| r.join("resources").join("pdfium").join(pdfium_lib));
+                let pdfium_path = match bundled_pdfium {
+                    Some(p) if p.exists() => p,
+                    _ => models_dir.join("pdfium").join(pdfium_lib),
+                };
+                unsafe { std::env::set_var("PDFIUM_DYLIB_PATH", &pdfium_path) };
+                tracing::info!("PDFIUM_DYLIB_PATH set to {:?}", pdfium_path);
+            }
+
+            let setup_settings = crate::commands::settings::get_settings_sync(&app_data_dir);
+
+            // 번들 모델 seed + ONNX Runtime DLL 검증 + 모델 자동 다운로드 — 백그라운드 실행.
+            // 기존에는 setup() 동기 실행이라 ~43MB SHA-256 해싱(DLL+OCR 3종)이 콜드 스타트
+            // (AV 상주 PC)에서 첫 창 표시를 1초+ 지연시켰다. 기존 실행 순서(seed → DLL 검증 →
+            // 모델/OCR 다운로드 체크)는 같은 스레드에서 순차 실행으로 그대로 유지 — 번들 적용
+            // 전에 다운로드 체크가 돌아 같은 파일을 동시에 쓰는 레이스를 막는다.
+            // Embedder/OCR 는 lazy(OnceCell) 초기화로 첫 사용 시점(빠르면 initialize_app 1초 후
+            // startup sync)이 DLL 검증 완료(통상 수백 ms)보다 늦어 ort panic 방지 목적은 유지된다.
+            //
+            // lite(내부망) 빌드에는 이 스레드가 통째로 없다. seed 는 "실행 중인 프로세스가
+            // AppData 에 PE(onnxruntime.dll·pdfium.dll)를 쓰고 그걸 로드"하는 상관을 만들어
+            // ZombieZERO 계열이 dropper 로 격리했던 바로 그 동작이고(이슈 #35), 나머지는 전부
+            // 런타임 다운로드다. lite 는 두 기능(시맨틱·OCR)을 제공하지 않으므로 손실이 없다.
+            #[cfg(feature = "online")]
+            {
+                let models_dir_bg = models_dir.clone();
+                let app_handle_bg = app.handle().clone();
+                let semantic_enabled = setup_settings.semantic_search_enabled;
+                let ocr_enabled = setup_settings.ocr_enabled;
+                std::thread::spawn(move || {
+                    // 번들 모델 적용: ONNX Runtime DLL + PaddleOCR 3종을 MSI 리소스에서
+                    // APPDATA/models/ 로 복사. 이미 같은 해시면 skip, 다르면 덮어쓰기.
+                    // 실패해도 다운로드 fallback 으로 자연 진행. 회사망/방화벽 등으로
+                    // huggingface·github 차단된 환경에서도 첫 실행 즉시 OCR/시맨틱 가능.
+                    if let Some(resource_dir) = resource_dir {
+                        model_downloader::seed_bundled_models(&resource_dir, &models_dir_bg);
+                    }
+
+                    // ONNX Runtime DLL 선제 준비 (14MB).
+                    // ort 2.x 는 DLL 버전 불일치 시 ort::init 단계에서 panic 을 일으키므로
+                    // OCR/Embedder 가 처음 DLL 을 건드리기 전에 SHA-256 검증으로 구버전을 강제 교체한다.
+                    // 검증만 하면 수백 ms, 다운로드가 필요하면 수초. 실패해도 앱 자체는 부팅시킨다
+                    // (시맨틱/OCR 기능이 비활성될 뿐 키워드 검색은 동작).
+                    if let Err(e) = model_downloader::ensure_onnx_runtime_dll(&models_dir_bg) {
+                        tracing::error!(
+                            "ONNX Runtime DLL 준비 실패: {}. 시맨틱/OCR 기능이 비활성됩니다.",
+                            e
+                        );
+                    }
+
+                    // 모델 자동 다운로드 — seed/DLL 검증 후에 존재 여부를 검사해야
+                    // 번들로 채워진 파일을 재다운로드하거나 동시에 쓰지 않는다.
+                    maybe_download_models(
+                        app_handle_bg.clone(),
+                        models_dir_bg.clone(),
+                        semantic_enabled,
+                    );
+
+                    // pdfium 준비 (스캔/이미지 PDF 페이지 래스터화 fallback) — OCR 활성 시에만.
+                    // best-effort: 실패해도 born-digital/JPEG 스캔 경로는 그대로 동작한다.
+                    if ocr_enabled {
+                        if let Err(e) = model_downloader::ensure_pdfium(&models_dir_bg) {
+                            tracing::warn!(
+                                "pdfium 준비 실패 (스캔 PDF 래스터화 OCR 비활성): {}",
+                                e
+                            );
+                        }
+                    }
+
+                    maybe_download_ocr_models(app_handle_bg.clone(), models_dir_bg, ocr_enabled);
+
+                    // OCR 엔진 워밍업 — **반드시 seed 이후**. seed_one 은 해시가 다르면
+                    // dict.txt 를 지웠다가 다시 복사하는데, 그 창에 OcrEngine::new 가 읽으면
+                    // "Dictionary not found" 로 실패하고 그 세션은 OCR 이 죽는다(이슈 #35).
+                    // AppContainer 는 setup 본류에서 manage 되므로 잠깐 기다렸다 잡는다.
+                    if ocr_enabled {
+                        for _ in 0..50 {
+                            if let Some(state) =
+                                app_handle_bg.try_state::<RwLock<AppContainer>>()
+                            {
+                                if let Ok(container) = state.read() {
+                                    container.spawn_ocr_warmup();
+                                }
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                });
+            }
+
+            // Initialize database with AppContainer
+            let container = AppContainer::new(&app_data_dir);
+            db::init_database(&container.db_path)
+                .map_err(|e| format!("Failed to initialize database: {}", e))?;
+
+            // DB 무결성 검사 — 대용량 DB에서 수십 초 걸릴 수 있어 백그라운드로 실행.
+            // 시작 시간을 차단하지 않고, 문제 감지 시 이벤트로 프론트엔드에 경고한다.
+            {
+                let db_path_for_check = container.db_path.clone();
+                let app_for_check = app.handle().clone();
+                std::thread::spawn(move || {
+                    let conn = match db::get_connection(&db_path_for_check) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("DB integrity check: connection failed: {}", e);
+                            return;
+                        }
+                    };
+                    match conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)) {
+                        Ok(result) if result == "ok" => {
+                            tracing::info!("DB integrity check passed");
+                        }
+                        Ok(result) => {
+                            tracing::error!("DB integrity check failed: {}", result);
+                            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+                            tracing::warn!("Attempted WAL recovery after integrity check failure");
+                            let _ = app_for_check.emit("db-integrity-warning", "데이터베이스 무결성 검사에 실패했습니다. 데이터가 손상되었을 수 있습니다.");
+                        }
+                        Err(e) => {
+                            tracing::error!("DB integrity check error: {}", e);
+                            let _ = app_for_check.emit("db-integrity-warning", format!("데이터베이스 검사 오류: {}", e));
+                        }
+                    }
+                });
+            }
+
+            tracing::info!("DocuFinder initialized. DB: {:?}", container.db_path);
+
+            // 이슈 #29: 기존에 매핑 드라이브(`Y:\`)로 등록된 감시 폴더·파일 경로를 UNC
+            // (`\\server\share`)로 마이그레이션. UAC elevated 실행 시 일반 세션의 매핑
+            // 드라이브가 안 보여 sync/재인덱싱이 os error 5 로 막히던 것을 자동 치유한다.
+            // 드라이브 매핑이 살아 있어야 resolve 되므로 매 시작마다 best-effort 재시도(멱등).
+            #[cfg(windows)]
+            if let Ok(conn) = db::get_connection(&container.db_path) {
+                if let Ok(folders) = db::get_watched_folders(&conn) {
+                    let mut seen = std::collections::HashSet::new();
+                    for f in &folders {
+                        let b = f.as_bytes();
+                        if b.len() < 2 || b[1] != b':' || !b[0].is_ascii_alphabetic() {
+                            continue; // 드라이브 경로 아님(UNC/posix)
+                        }
+                        let letter = (b[0] as char).to_ascii_uppercase();
+                        if !seen.insert(letter) {
+                            continue; // 드라이브당 1회
+                        }
+                        let root = format!("{letter}:\\");
+                        if let Some(unc) = crate::utils::network_path::resolve_mapped_drive_to_unc(
+                            std::path::Path::new(&root),
+                        ) {
+                            let base = unc.to_string_lossy();
+                            match db::remap_drive_prefix(&conn, letter, &base) {
+                                Ok((nf, nd)) if nf + nd > 0 => tracing::info!(
+                                    "[#29] {letter}:\\ → {base} 마이그레이션: files {nf}, folders {nd}"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!("[#29] {letter}: 마이그레이션 실패: {e}"),
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 이전 세션에서 남긴 미전송 crash log 를 Telegram 으로 지연 전송
+            // (네이티브 크래시/OOM kill 등 panic hook 이 실행되지 못한 경우 대비)
+            // 사용자 설정 백엔드 게이트는 함수 내부에서 처리한다.
+            commands::telemetry::spawn_flush_pending_crash_logs(container.app_data_dir.clone());
+
+            // kordoc 사이드카 가용성 진단 — HWP5 는 Rust fallback 이 없어 kordoc 미가용 시 전수 실패한다.
+            // 미가용이면 frontend 에 즉시 알려 인덱싱 시작 전에 사용자가 인지할 수 있게 한다 (이슈 #22).
+            {
+                let kordoc_ok = parsers::kordoc::is_available();
+                if kordoc_ok {
+                    tracing::info!("kordoc 사이드카 가용 — hwp/hwpx/docx/pdf 변환 활성");
+                } else {
+                    tracing::error!(
+                        "kordoc 사이드카 미가용 — HWP 파일 인덱싱 불가. \
+                         번들 node / kordoc CLI 가 .app 내부에 누락되었거나 실행 권한이 없습니다."
+                    );
+                }
+                let _ = app.handle().emit("kordoc-availability", kordoc_ok);
+            }
+
+            // Check semantic search availability
+            if container.is_semantic_available() {
+                tracing::info!("Semantic search: enabled");
+                // VectorIndex를 즉시 init하여 WatchManager의 OnceCell 공유 값을
+                // pre-populate. 이렇게 해야 사용자가 검색을 한 번도 하지 않은
+                // 상태에서도 파일 삭제/수정 이벤트에 벡터가 정리된다 (orphan 방지).
+                // 주의: Embedder는 ONNX 로드가 무거워 lazy 유지. VectorIndex는
+                // usearch mmap view라 저렴함.
+                if let Err(e) = container.get_vector_index() {
+                    tracing::warn!("VectorIndex pre-init 실패: {}", e);
+                }
+            } else {
+                tracing::warn!(
+                    "Semantic search: disabled (model not found at {:?})",
+                    container.models_dir.join("kosimcse-roberta-multitask")
+                );
+            }
+
+            // Check OCR availability
+            if container.is_ocr_available() && setup_settings.ocr_enabled {
+                tracing::info!("OCR: enabled (PaddleOCR ONNX)");
+            } else if setup_settings.ocr_enabled {
+                tracing::warn!("OCR: enabled but model not found (downloading...)");
+            } else {
+                tracing::info!("OCR: disabled");
+            }
+
+            // 증분 인덱싱 완료 시 프론트엔드 알림 콜백 설정
+            {
+                let app_handle = app.handle().clone();
+                container.set_incremental_update_callback(Arc::new(move |count| {
+                    tracing::info!("[WatchManager] Incremental update: {} files", count);
+                    let _ = app_handle.emit("incremental-index-updated", count);
+                }));
+            }
+
+            // watcher가 자동 트리거한 벡터 인덱싱도 완료 시 watcher를 정상 재개해야 한다.
+            {
+                let app_handle = app.handle().clone();
+                container.set_vector_progress_callback(Arc::new(move |progress| {
+                    let _ = app_handle.emit("vector-indexing-progress", &progress);
+                    if progress.is_complete {
+                        if let Some(container_state) =
+                            app_handle.try_state::<RwLock<AppContainer>>()
+                        {
+                            if let Ok(container) = container_state.read() {
+                                resume_watchers(&container);
+                            }
+                        }
+                    }
+                }));
+            }
+
+            // 기존 감시 폴더들 자동 감시 복원 — app.manage 이후 백그라운드 스레드로 실행한다.
+            // v3.4.5 이전에는 resume_watchers 가 get_watch_manager 를 통해 OCR 엔진(ort 세션)을
+            // 즉시 빌드해서, 내부망 EDR 이 그 로드를 격리하거나 ort 로드가 지연되면 setup 메인
+            // 스레드가 물려 창 표시 자체가 막혔다(이슈 #35). 지금은 OCR 셀을 공유만 하지만,
+            // WatchManager 생성은 감시 폴더 수만큼 파일시스템을 훑으므로 백그라운드가 맞다.
+            // (아래로 이동됨)
+
+            // ⚡ 디스크 타입 사전 감지 (C:, D: — PowerShell 호출 1-3초를 앱 시작 시 흡수)
+            tauri::async_runtime::spawn(async {
+                tokio::task::spawn_blocking(|| {
+                    for letter in ['C', 'D', 'E'] {
+                        let path = format!("{}:\\", letter);
+                        if std::path::Path::new(&path).exists() {
+                            let _ = crate::utils::disk_info::detect_disk_type(
+                                std::path::Path::new(&path),
+                            );
+                        }
+                    }
+                    tracing::debug!("Disk type pre-detection completed");
+                })
+                .await
+                .ok();
+            });
+
+            // ⚡ 파일명 캐시 로드 (Everything 스타일 빠른 검색) + 벡터 인덱스 ↔ DB 정합성 검증
+            // — 백그라운드 실행. 캐시 DB 전체 SELECT 는 HDD 5-10초(filename_cache.rs 주석),
+            // 정합성 검증은 chunks JOIN files COUNT 풀스캔 2회로 역시 수 초 걸릴 수 있어
+            // setup() 동기 실행 시 첫 창 표시를 그만큼 지연시킨다. 캐시 로드 완료 전 파일명
+            // 검색은 기존 DB LIKE 폴백이 처리하고(search_service/keyword.rs use_cache 게이트:
+            // !is_empty && !is_truncated), 두 작업은 기존 순서대로 같은 스레드에서 순차 실행해
+            // HDD 디스크 경합을 피한다. container 는 아래 app.manage 로 move 되므로
+            // Arc/PathBuf 만 복제해 넘긴다.
+            {
+                let filename_cache = container.get_filename_cache();
+                let db_path = container.db_path.clone();
+                let vector_index_path = container.vector_index_path.clone();
+                let semantic_available = container.is_semantic_available();
+                std::thread::spawn(move || {
+                    match db::get_connection(&db_path) {
+                        Ok(conn) => match filename_cache.load_from_db(&conn) {
+                            Ok(count) => {
+                                tracing::info!("FilenameCache loaded: {} files", count);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to load filename cache: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!("Failed to load filename cache: {}", e);
+                        }
+                    }
+
+                    validate_vector_index(&vector_index_path, &db_path, semantic_available);
+                });
+            }
+
+            // Store app container
+            app.manage(RwLock::new(container));
+
+            // OCR 워밍업은 위 seed 스레드 끝(모델 준비 완료 후)에서 건다 — 여기서 걸면
+            // 번들 seed 의 dict.txt 재복사와 레이스가 난다(이슈 #35).
+
+            // 감시 폴더 자동 복원 (위에서 이동) — OCR 엔진 빌드가 창 표시를 막지 않도록 분리.
+            {
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    if let Some(container_state) =
+                        app_handle.try_state::<RwLock<AppContainer>>()
+                    {
+                        if let Ok(container) = container_state.read() {
+                            resume_watchers(&container);
+                        }
+                    }
+                });
+            }
+
+            // 🔄 주기 sync task 시작 (v2.5.2) — watcher 이벤트 누락 보완.
+            // lib.rs setup 에서 1회만 spawn. AtomicBool shutdown 신호는
+            // cleanup_vector_resources / 앱 종료 시 세팅되어 루프가 탈출한다.
+            indexer::periodic_sync::spawn_periodic_sync_task(app.handle().clone());
+
+            // 미완료 벡터 인덱싱 + startup sync 모두 initialize_app에서 처리.
+            // (면책 동의 후 프론트엔드 호출 → spawn_startup_sync_async)
+            // lib.rs에서 spawn_startup_sync를 별도로 호출하면
+            // initialize_app의 spawn_startup_sync_async와 동시 실행되어
+            // 같은 폴더에 대해 reindex가 2번 동시에 발생 → SQLITE_BUSY + 데이터 중복.
+
+            // 개발 모드에서 DevTools 열기 (DEVTOOLS=1 환경변수로 제어)
+            #[cfg(debug_assertions)]
+            if std::env::var("DEVTOOLS").unwrap_or_default() == "1" {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
+            }
+
+            // 시스템 트레이 설정
+            let show_item = MenuItem::with_id(app, "show", "열기", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            // 트레이 전용 아이콘 로드 (tray-icon.png), 실패 시 기본 아이콘 fallback
+            let tray_icon = {
+                let tray_icon_path = app
+                    .path()
+                    .resource_dir()
+                    .ok()
+                    .map(|d| d.join("icons").join("tray-icon.png"))
+                    .unwrap_or_default();
+                if tray_icon_path.exists() {
+                    match tauri::image::Image::from_path(&tray_icon_path) {
+                        Ok(img) => {
+                            tracing::info!("Loaded tray icon from {:?}", tray_icon_path);
+                            img
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to load tray icon: {e}, falling back to default"
+                            );
+                            app.default_window_icon()
+                                .cloned()
+                                .unwrap_or_else(|| tauri::image::Image::new(&[], 0, 0))
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        "Tray icon file not found at {:?}, using default",
+                        tray_icon_path
+                    );
+                    app.default_window_icon()
+                        .cloned()
+                        .unwrap_or_else(|| tauri::image::Image::new(&[], 0, 0))
+                }
+            };
+            let _tray = TrayIconBuilder::new()
+                .icon(tray_icon)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .tooltip("Finder")
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        graceful_shutdown(app);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            tracing::info!("System tray initialized");
+
+            // 시작 시 최소화 처리 (--minimized 인자 또는 설정)
+            let args: Vec<String> = std::env::args().collect();
+            let minimized_arg = args.iter().any(|a| a == "--minimized");
+            let settings = commands::settings::get_settings_sync(&app_data_dir);
+
+            if minimized_arg || settings.start_minimized {
+                // on_page_load에서 show하지 않도록 플래그 설정
+                show_on_load.store(false, Ordering::Relaxed);
+                // setup 시점에도 명시적으로 숨김 (window-state나 Tauri 내부에서 show될 수 있으므로)
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                tracing::info!("Started minimized to tray");
+            }
+
+            Ok(())
+        })
+        .on_page_load(move |webview, payload| {
+            let event = payload.event();
+            tracing::info!(
+                "[PERF] on_page_load: url={}, event={:?}",
+                payload.url(),
+                event
+            );
+
+            if let Some(window) = webview.app_handle().get_webview_window("main") {
+                if show_on_load_flag.load(Ordering::Relaxed) {
+                    // 일반 시작: Finished 이벤트에서 창 표시 (검정화면 방지)
+                    if matches!(event, tauri::webview::PageLoadEvent::Finished) {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        tracing::info!("[PERF] Window shown after page load");
+                    }
+                } else {
+                    // start_minimized: Started/Finished 이벤트 모두에서 즉시 숨김
+                    let _ = window.hide();
+                    tracing::info!("[PERF] Window hidden (start minimized, event={:?})", event);
+                }
+            }
+        })
+        .on_window_event(|window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    let app_data_dir = window
+                        .app_handle()
+                        .path()
+                        .app_data_dir()
+                        .unwrap_or_default();
+                    let settings =
+                        commands::settings::get_settings_sync(&app_data_dir);
+                    if settings.close_to_tray {
+                        api.prevent_close();
+                        let _ = window.hide();
+                        tracing::debug!("Window hidden to tray");
+                    } else {
+                        tracing::info!("Window closing (close_to_tray=false)");
+                        // 트레이 아이콘이 프로세스를 유지시키므로 명시적 종료 필요
+                        graceful_shutdown(window.app_handle());
+                    }
+                }
+                tauri::WindowEvent::Destroyed => {
+                    if let Some(container) = window.try_state::<RwLock<AppContainer>>() {
+                        if let Ok(container) = container.read() {
+                            cleanup_vector_resources(&container);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            drag_preview_icon,
+            commands::search::search_keyword,
+            commands::search::search_filename,
+            commands::search::search_semantic,
+            commands::search::search_hybrid,
+            commands::search::search_smart,
+            commands::search::find_similar_documents,
+            commands::search::classify_documents,
+            commands::search::save_search_query,
+            commands::search::get_document_statistics,
+            commands::search::get_recently_opened_documents,
+            commands::search::remove_recently_opened_document,
+            commands::index::add_folder,
+            commands::index::classify_folder,
+            commands::index::remove_folder,
+            commands::index::get_index_status,
+            commands::index::get_all_folder_stats,
+            commands::index::get_folders_with_info,
+            commands::index::toggle_favorite,
+            commands::index::cancel_indexing,
+            commands::index::reindex_folder,
+            commands::index::reindex_file,
+            commands::index::resume_indexing,
+            commands::index::reset_folder_indexing,
+            commands::index::get_vector_indexing_status,
+            commands::index::cancel_vector_indexing,
+            commands::index::start_vector_indexing,
+            commands::index::clear_all_data,
+            commands::index::initialize_app,
+            commands::index::start_indexing_batch,
+            commands::index::get_indexing_batch,
+            commands::index::cancel_indexing_batch,
+            commands::settings::get_settings,
+            commands::settings::update_settings,
+            commands::settings::count_ocr_reindex_candidates,
+            commands::file::open_file,
+            commands::file::open_url,
+            commands::file::check_github_release,
+            commands::file::open_folder,
+            commands::file::log_frontend_error,
+            commands::file::open_log_dir,
+            commands::system::get_suggested_folders,
+            commands::preview::load_markdown_preview,
+            commands::preview::render_layout_svg,
+            commands::preview::render_pdf_page,
+            commands::preview::add_bookmark,
+            commands::preview::remove_bookmark,
+            commands::preview::update_bookmark_note,
+            commands::preview::get_bookmarks,
+            commands::export::export_csv,
+            commands::export::export_markdown,
+            commands::search::get_search_history_stats,
+            commands::duplicate::find_duplicates,
+            commands::lineage::rebuild_lineage,
+            commands::lineage::get_lineage_versions,
+            commands::lineage::get_lineage_health,
+            commands::lineage::get_lineage_diff,
+            commands::maintenance::prune_missing_files,
+            commands::tags::add_file_tag,
+            commands::tags::remove_file_tag,
+            commands::tags::get_file_tags,
+            commands::tags::get_all_tags,
+            commands::typo::suggest_correction,
+            commands::ai::ask_ai,
+            commands::ai::ask_ai_file,
+            commands::ai::summarize_ai,
+            commands::telemetry::report_error,
+            commands::formula::get_formula_models_status,
+            commands::formula::download_formula_models,
+            indexer::periodic_sync::trigger_sync_if_stale,
+        ])
+        .build(tauri::generate_context!())
+        .map(|app| {
+            app.run(|app_handle, event| {
+                // macOS dock 아이콘 클릭(Reopen) 시 트레이로 숨겨진 윈도우 다시 표시.
+                // close_to_tray 로 hide() 된 상태에서 dock 클릭하면 자동 복귀.
+                #[cfg(target_os = "macos")]
+                if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                    if !has_visible_windows {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (app_handle, event);
+                }
+            });
+            Ok::<(), tauri::Error>(())
+        })
+        .and_then(|r| r)
+        .unwrap_or_else(|e| {
+            eprintln!("Fatal: Tauri failed to start: {}", e);
+            // 크래시 로그에도 기록 (append 모드: 이전 기록 보존)
+            if let Some(data_dir) = dirs::data_dir() {
+                let crash_dir = data_dir.join(crate::APP_IDENTIFIER);
+                let _ = std::fs::create_dir_all(&crash_dir);
+                let crash_log = crash_dir.join("crash.log");
+                // 크기 제한: 1MB 초과 시 truncate
+                const MAX_CRASH_LOG_SIZE: u64 = 1024 * 1024;
+                if let Ok(meta) = std::fs::metadata(&crash_log) {
+                    if meta.len() > MAX_CRASH_LOG_SIZE {
+                        let _ = std::fs::remove_file(&crash_log);
+                    }
+                }
+                let entry = format!(
+                    "[{}] FATAL: Tauri failed to start: {}\n",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    e
+                );
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&crash_log)
+                {
+                    let _ = file.write_all(entry.as_bytes());
+                }
+            }
+            std::process::exit(1);
+        });
+}

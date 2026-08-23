@@ -1,0 +1,319 @@
+/* ============================================
+   Semantic Color Utilities (인라인 style 대체)
+   ============================================ */
+
+/* Backgrounds */
+.bg-primary   { background-color: var(--color-bg-primary); }
+.bg-secondary { background-color: var(--color-bg-secondary); }
+.bg-tertiary  { background-color: var(--color-bg-tertiary); }
+.bg-subtle    { background-color: var(--color-bg-subtle); }
+.bg-accent-subtle { background-color: var(--color-accent-subtle); }
+
+/* Text Colors */
+.clr-primary   { color: var(--color-text-primary); }
+.clr-secondary { color: var(--color-text-secondary); }
+.clr-muted     { color: var(--color-text-muted); }
+.clr-accent    { color: var(--color-accent); }
+.clr-success   { color: var(--color-success); }
+.clr-warning   { color: var(--color-warning); }
+.clr-error     { color: var(--color-error); }
+.clr-info      { color: var(--color-info); }
+.clr-favorite  { color: var(--color-favorite); }
+
+/* Borders */
+.border-default { border-color: var(--color-border); }
+.border-subtle  { border-color: var(--color-border-subtle); }
+
+/* ============================================
+   Hover Utility Classes (DOM 조작 대체용)
+   ============================================ */
+
+/* Sidebar adaptive hover classes */
+.hover-sidebar-item {
+  color: var(--color-sidebar-muted);
+  transition: color 0.15s, background-color 0.15s;
+}
+.hover-sidebar-item:hover {
+  color: var(--color-sidebar-text);
+  background-color: var(--color-sidebar-hover);
+}
+
+.hover-sidebar-section {
+  /* 헤더는 muted — 안내문(sidebar-section)보다 한 단계 진하게 층을 만든다 */
+  color: var(--color-sidebar-muted);
+  transition: color 0.15s;
+}
+.hover-sidebar-section:hover {
+  color: var(--color-sidebar-text);
+}
+
+.hover-sidebar-danger {
+  color: var(--color-sidebar-muted);
+  transition: color 0.15s, background-color 0.15s;
+}
+.hover-sidebar-danger:hover {
+  color: var(--color-error);
+  background-color: var(--color-sidebar-hover);
+}
+
+/* Primary Button Hover — 강조 액션 */
+.hover-btn-primary {
+  transition: all var(--transition-fast);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+.hover-btn-primary:hover:not(:disabled) {
+  background-color: var(--color-accent-hover);
+  border-color: var(--color-accent-hover);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+}
+.hover-btn-primary:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* Secondary Button Hover */
+.hover-btn-secondary {
+  transition: all var(--transition-fast);
+}
+.hover-btn-secondary:hover:not(:disabled) {
+  background-color: var(--color-bg-tertiary);
+  border-color: var(--color-border-hover);
+  color: var(--color-text-primary);
+}
+.hover-btn-secondary:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+  box-shadow: none;
+}
+
+/* Ghost Button Hover — subtle 이지만 명확한 피드백 */
+.hover-btn-ghost {
+  transition: all var(--transition-fast);
+}
+.hover-btn-ghost:hover:not(:disabled) {
+  background-color: var(--color-accent-light);
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+.hover-btn-ghost:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+  box-shadow: none;
+}
+
+/* Dropdown Trigger Hover */
+.dropdown-trigger:hover:not(:disabled) {
+  border-color: var(--color-border-hover) !important;
+  background-color: var(--color-bg-hover, var(--color-bg-tertiary));
+}
+.dropdown-trigger:active:not(:disabled) {
+  transform: scale(0.99);
+}
+
+/* Settings Tab Button Hover (비활성 탭만) */
+.settings-tab-btn:not(.active):hover {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+.settings-tab-btn {
+  transition: all var(--transition-fast);
+}
+
+/* Danger Button Hover */
+.hover-btn-danger {
+  transition: all var(--transition-fast);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+.hover-btn-danger:hover:not(:disabled) {
+  background-color: var(--color-error-hover);
+  border-color: var(--color-error-hover);
+  box-shadow: 0 2px 6px rgba(239, 68, 68, 0.2);
+}
+.hover-btn-danger:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* Settings Toggle hover — 토글 스위치에 피드백 */
+button[role="switch"] {
+  transition: all var(--transition-fast);
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+}
+button[role="switch"]:hover:not(:disabled) {
+  outline-color: var(--color-accent-muted);
+  transform: scale(1.04);
+}
+button[role="switch"]:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+/* Icon Button Hover */
+.hover-icon-btn {
+  transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+.hover-icon-btn:hover {
+  color: var(--color-text-primary);
+  background-color: var(--color-bg-tertiary);
+}
+
+/* Icon Button Accent Hover */
+.hover-icon-accent {
+  transition: color var(--transition-fast);
+}
+.hover-icon-accent:hover {
+  color: var(--color-accent);
+}
+
+/* Danger Action Hover (삭제 버튼 등) */
+.hover-action-danger {
+  transition: all var(--transition-fast);
+}
+.hover-action-danger:hover {
+  color: var(--color-error);
+  background-color: var(--color-error-bg);
+}
+
+/* Dropdown Option Hover */
+.hover-dropdown-option {
+  transition: background-color var(--transition-fast);
+}
+.hover-dropdown-option:hover {
+  background-color: var(--color-bg-tertiary);
+}
+
+/* Content Area Hover (확장 영역 등) */
+.hover-content-area {
+  transition: background-color var(--transition-fast);
+}
+.hover-content-area:hover {
+  background-color: var(--color-bg-tertiary);
+}
+
+/* ============================================
+   Reusable Hover Utilities
+   (인라인 onMouseEnter/onMouseLeave 대체)
+   ============================================ */
+
+/* 닫기/아이콘 버튼 hover */
+.btn-icon-hover {
+  color: var(--color-text-muted);
+  background-color: transparent;
+  transition: all 0.15s;
+}
+.btn-icon-hover:hover {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+.btn-icon-hover:active {
+  transform: scale(0.95);
+}
+
+/* 파일명 hover (텍스트 → 액센트) */
+.hover-accent-text {
+  color: var(--color-text-primary);
+  transition: color 0.15s;
+}
+.hover-accent-text:hover {
+  color: var(--color-accent);
+}
+
+/* 결과 아이템 hover (배경색 전환) */
+.result-item-hover {
+  background-color: var(--color-bg-secondary);
+  transition: background-color 0.15s;
+}
+.result-item-hover:hover {
+  background-color: var(--color-bg-tertiary);
+}
+
+/* 아웃라인 버튼 hover (액센트 전환) */
+.btn-outline-accent-hover {
+  background-color: var(--color-bg-secondary);
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+.btn-outline-accent-hover:hover {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+  background-color: var(--color-accent-light);
+}
+
+/* 취소 버튼 hover */
+.btn-cancel-hover {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+  transition: background-color 0.15s, color 0.15s;
+}
+.btn-cancel-hover:hover {
+  background-color: var(--color-error);
+  color: white;
+}
+
+/* 시맨틱 시작 버튼 hover */
+.btn-accent-start-hover {
+  background-color: var(--color-bg-tertiary);
+  color: var(--color-accent);
+  transition: background-color 0.15s, color 0.15s;
+}
+.btn-accent-start-hover:hover {
+  background-color: var(--color-accent);
+  color: white;
+}
+
+/* 초기화 버튼 hover */
+.btn-reset-hover {
+  color: var(--color-text-muted);
+  background-color: transparent;
+  transition: background-color 0.15s, color 0.15s;
+}
+.btn-reset-hover:hover {
+  color: var(--color-error);
+  background-color: var(--color-error-bg);
+}
+
+/* transparent → tertiary hover */
+.hover-bg-tertiary {
+  background-color: transparent;
+  transition: background-color 0.15s;
+}
+.hover-bg-tertiary:hover {
+  background-color: var(--color-bg-tertiary);
+}
+
+/* tertiary → subtle hover */
+.hover-bg-subtle {
+  transition: background-color 0.15s;
+}
+.hover-bg-subtle:hover {
+  background-color: var(--color-bg-subtle);
+}
+
+/* ============================================
+   Accessibility: 키보드 포커스 링
+   마우스 사용자는 보이지 않고, 키보드 사용자에게만 표시
+   ============================================ */
+
+/* 모든 버튼 — 키보드 포커스 시 accent 링 */
+button:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* 입력 필드 포커스 — 컨테이너 ring이 처리하므로 outline 제거 */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+}
+
+/* [tabindex] 커스텀 요소 */
+[tabindex]:not([tabindex="-1"]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* 마우스 클릭 시 outline 제거 (브라우저 기본 동작 보완) */
+button:focus:not(:focus-visible),
+[tabindex]:focus:not(:focus-visible) {
+  outline: none;
+}

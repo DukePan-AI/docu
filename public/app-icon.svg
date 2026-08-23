@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Magnifying glass handle -->
+  <line x1="370" y1="370" x2="460" y2="460" stroke="#2EB88A" stroke-width="56" stroke-linecap="round"/>
+  <!-- Magnifying glass ring -->
+  <circle cx="240" cy="240" r="200" fill="none" stroke="#2EB88A" stroke-width="56"/>
+  <!-- Black fill inside lens -->
+  <circle cx="240" cy="240" r="172" fill="#1a1a1a"/>
+  <!-- Letter A -->
+  <path d="M240 90 L140 380 L180 380 L200 320 L280 320 L300 380 L340 380 Z M215 285 L240 200 L265 285 Z" fill="white"/>
+  <!-- Degree dot -->
+  <circle cx="310" cy="145" r="18" fill="white"/>
+</svg>

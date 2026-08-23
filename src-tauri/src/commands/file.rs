@@ -1,0 +1,502 @@
+use std::path::Path;
+use std::process::Command;
+use std::sync::RwLock;
+
+use tauri::{AppHandle, Manager, State};
+
+use crate::AppContainer;
+
+/// Windows 시스템 실행파일 절대경로 — PATH hijack 방지.
+/// `SystemRoot` 환경변수(기본 `C:\Windows`) 하위 System32 의 풀패스를 반환.
+#[cfg(target_os = "windows")]
+fn windows_system32(exe: &str) -> std::path::PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
+    std::path::PathBuf::from(root).join("System32").join(exe)
+}
+
+/// 플랫폼별 기본 앱으로 경로 열기 (공통 헬퍼)
+fn open_with_default(path_str: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // explorer.exe 는 System32 가 아니라 Windows 디렉토리 루트에 있다.
+        // windows_system32 로 만들면 C:\Windows\System32\explorer.exe — 부재
+        // 경로라 spawn 이 항상 실패한다 (PATH hijack 방지 커밋 #28 의 회귀로
+        // 파일/폴더/로그폴더 열기가 모두 깨져 있었음).
+        let win_root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
+        Command::new(std::path::PathBuf::from(win_root).join("explorer.exe"))
+            .arg(path_str)
+            .spawn()
+            .map_err(|e| format!("열기 실패: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(path_str)
+            .spawn()
+            .map_err(|e| format!("열기 실패: {}", e))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(path_str)
+            .spawn()
+            .map_err(|e| format!("열기 실패: {}", e))?;
+    }
+    Ok(())
+}
+
+/// 플랫폼별 파일 탐색기에서 파일을 선택(reveal)한 채로 폴더 열기 (공통 헬퍼)
+fn reveal_with_default(path_str: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // explorer /select,"<path>" — 폴더를 열고 해당 파일을 선택 상태로 표시.
+        // open_with_default 와 동일하게 Windows 루트의 explorer.exe 절대경로 사용.
+        //
+        // .arg() 사용 금지: 경로에 공백이 있으면 Rust 가 인자 전체를 따옴표로 감싸
+        // ("/select,C:\a b\f.txt") explorer 가 /select 스위치를 인식하지 못하고
+        // 기본 폴더만 연다. raw_arg 로 경로만 따옴표로 감싼 원형을 그대로 넘긴다.
+        // Windows 파일명에 " 문자는 허용되지 않으므로 추가 이스케이프 불필요.
+        let win_root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
+        Command::new(std::path::PathBuf::from(win_root).join("explorer.exe"))
+            .raw_arg(format!("/select,\"{}\"", path_str))
+            .spawn()
+            .map_err(|e| format!("열기 실패: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // open -R — Finder 에서 파일을 reveal (선택 상태로 표시)
+        Command::new("open")
+            .arg("-R")
+            .arg(path_str)
+            .spawn()
+            .map_err(|e| format!("열기 실패: {}", e))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 대부분의 Linux 파일 매니저는 파일 선택을 지원하지 않으므로 부모 폴더 열기로 폴백
+        let parent = std::path::Path::new(path_str)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| path_str.to_string());
+        Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("열기 실패: {}", e))?;
+    }
+    Ok(())
+}
+
+/// 허용된 파일 확장자 (대소문자 무관)
+const ALLOWED_EXTENSIONS: &[&str] = &[
+    "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "hwp", "hwpx", "txt", "md", "rtf", "csv",
+    "jpg", "jpeg", "png", "gif", "bmp", "webp",
+];
+
+/// 경로 검증 (path traversal 방지)
+fn validate_path(path: &str) -> Result<std::path::PathBuf, String> {
+    let path = Path::new(path);
+
+    // canonicalize로 경로 정규화 (.. 등 해결)
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "유효하지 않은 경로입니다".to_string())?;
+
+    Ok(canonical)
+}
+
+/// 파일 확장자 검증
+fn validate_extension(path: &Path) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if ALLOWED_EXTENSIONS.contains(&extension.as_str()) {
+        Ok(())
+    } else {
+        Err(format!("지원하지 않는 파일 형식입니다: {}", extension))
+    }
+}
+
+/// 파일을 기본 앱으로 열기 (페이지 지정 가능)
+#[tauri::command]
+pub async fn open_file(
+    path: String,
+    page: Option<i64>,
+    state: State<'_, RwLock<AppContainer>>,
+) -> Result<(), String> {
+    // 경로 검증
+    let canonical_path = validate_path(&path)?;
+
+    // 파일 존재 확인
+    if !canonical_path.is_file() {
+        return Err("파일을 찾을 수 없습니다".to_string());
+    }
+
+    // 확장자 검증
+    validate_extension(&canonical_path)?;
+
+    // 시스템 폴더 내 파일 접근 차단
+    let path_lower = canonical_path.to_string_lossy().to_lowercase();
+    for pattern in crate::constants::BLOCKED_PATH_PATTERNS {
+        if path_lower.contains(&pattern.to_lowercase()) {
+            return Err("시스템 보호 폴더의 파일은 열 수 없습니다".to_string());
+        }
+    }
+
+    // 감시 폴더 내 파일인지 검증 (화이트리스트, 감시 폴더 미등록 시 거부)
+    {
+        let db_path = {
+            let container = state.read().map_err(|_| "내부 오류".to_string())?;
+            container.db_path.to_string_lossy().to_string()
+        };
+        let conn = crate::db::get_connection(std::path::Path::new(&db_path))
+            .map_err(|_| "내부 오류".to_string())?;
+        let folders = crate::db::get_watched_folders(&conn).map_err(|_| "내부 오류".to_string())?;
+        if folders.is_empty() {
+            return Err("등록된 감시 폴더가 없어 파일을 열 수 없습니다".to_string());
+        }
+        let canonical_str = canonical_path.to_string_lossy();
+        let in_scope = folders
+            .iter()
+            .any(|f| crate::utils::folder_scope::path_in_scope(&canonical_str, f));
+        if !in_scope {
+            return Err("감시 폴더 외부 파일은 열 수 없습니다".to_string());
+        }
+    }
+
+    // Windows canonicalize()가 \\?\ 접두사를 추가하는데, explorer.exe가 이해 못함.
+    // 단순 strip 은 \\?\UNC\srv\share\... 를 UNC\srv\... 로 깨뜨리므로(매핑드라이브·
+    // 네트워크 파일 열기 실패 + DB open_count 경로 불일치) dunce 기반 simplify 사용.
+    let path_str = crate::utils::network_path::simplify(&canonical_path)
+        .to_string_lossy()
+        .to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        let extension = canonical_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        // PDF는 SumatraPDF로 페이지 지정 열기 시도
+        let page = page.map(|p| p.clamp(1, 100_000)); // 페이지 범위 검증
+        if let (true, Some(page_num)) = (extension == "pdf", page) {
+            // SumatraPDF 경로 확인
+            let sumatra_paths = [
+                r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
+                r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
+            ];
+
+            // 1) 하드코딩 경로 (가장 흔한 설치 위치)
+            let mut sumatra_exe: Option<String> = None;
+            for sumatra_path in &sumatra_paths {
+                if Path::new(sumatra_path).exists() {
+                    sumatra_exe = Some(sumatra_path.to_string());
+                    break;
+                }
+            }
+
+            // 2) PATH 환경변수에서 검색 (비표준 설치 위치 대응).
+            // where.exe 자체는 System32 풀패스 사용 (PATH hijack 방지).
+            // 결과(SumatraPDF.exe 위치)는 사용자 PATH 의존 — 정상 사용 케이스.
+            if sumatra_exe.is_none() {
+                if let Ok(output) = Command::new(windows_system32("where.exe"))
+                    .arg("SumatraPDF.exe")
+                    .output()
+                {
+                    if output.status.success() {
+                        if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                            let path = path.trim();
+                            if !path.is_empty() {
+                                sumatra_exe = Some(path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(exe) = sumatra_exe {
+                Command::new(&exe)
+                    .args(["-page", &page_num.to_string(), &path_str])
+                    .spawn()
+                    .map_err(|e| format!("PDF 열기 실패: {}", e))?;
+                return Ok(());
+            }
+
+            // SumatraPDF 없으면 기본 앱으로 열기
+            tracing::warn!("SumatraPDF not found, opening with default app");
+        }
+
+        // 기본 앱으로 열기
+        open_with_default(&path_str)?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = page; // unused on non-Windows
+        open_with_default(&path_str)?;
+    }
+
+    // Behavioral Canonical: 파일 열람 횟수 + 최근 열람 시각 기록.
+    // canonical_score 계산에 반영되어 "실제로 사용되는 버전"이 canonical로 승격된다.
+    // DB 오류는 무시 (파일 열기는 성공했으므로 UX 방해 금지).
+    {
+        let db_path_opt = state.read().ok().map(|c| c.db_path.clone());
+        if let Some(db_path) = db_path_opt {
+            let path_for_track = path_str.clone();
+            tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = crate::db::get_connection(&db_path) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let _ = conn.execute(
+                            "UPDATE files
+                             SET open_count = COALESCE(open_count, 0) + 1,
+                                 last_opened_at = ?1
+                             WHERE path = ?2",
+                            rusqlite::params![now, path_for_track],
+                        );
+
+                        // Canonical 재선출 — 같은 lineage 내에서 open 기반 점수 재평가
+                        let _ = crate::indexer::lineage::rebalance_canonical_for_opened(
+                            &conn,
+                            &path_for_track,
+                        );
+                    }
+                })
+                .await;
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// URL을 기본 브라우저로 열기 (법령 링크 등)
+#[tauri::command]
+pub async fn open_url(url: String) -> Result<(), String> {
+    // https:// 또는 http:// 만 허용 (보안)
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("허용되지 않는 URL 스키마입니다".to_string());
+    }
+
+    // URL 길이 제한 (악용 방지)
+    if url.len() > 2048 {
+        return Err("URL이 너무 깁니다".to_string());
+    }
+
+    // 제어문자/whitespace 검증 (command injection 방지)
+    if url.chars().any(|c| c.is_control() || c == ' ' || c == '\t') {
+        return Err("URL에 허용되지 않는 문자가 포함되어 있습니다".to_string());
+    }
+
+    // lite(내부망) 빌드는 rundll32 를 쓰지 않는다. `rundll32.exe url.dll,FileProtocolHandler`
+    // 는 정상 용법이지만 EDR/APT 제품이 대표 LOLBin 실행(T1218.011)으로 분류하는 호출이라,
+    // 이미 파일/폴더 열기에 쓰고 있는 explorer.exe 로 통일해 프로세스 생성 종류를 줄인다.
+    // explorer.exe 도 http/https 를 기본 브라우저로 넘긴다. 인자는 Command 가 직접 전달하므로
+    // cmd 를 거치지 않아 `&` 인젝션 우려는 rundll32 경로와 동일하게 없다.
+    #[cfg(all(target_os = "windows", not(feature = "online")))]
+    {
+        open_with_default(&url)?;
+    }
+
+    #[cfg(all(target_os = "windows", feature = "online"))]
+    {
+        // cmd /C start는 URL 내 &를 명령 구분자로 해석할 수 있으므로
+        // rundll32로 직접 URL 프로토콜 핸들러 호출 (cmd 인젝션 방지).
+        // System32 풀패스 사용으로 PATH hijack 방지.
+        Command::new(windows_system32("rundll32.exe"))
+            .args(["url.dll,FileProtocolHandler", &url])
+            .spawn()
+            .map_err(|e| format!("URL 열기 실패: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("URL 열기 실패: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("URL 열기 실패: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// GitHub Releases API 를 호출해 최신 릴리즈 정보를 반환.
+///
+/// macOS는 ad-hoc 서명/Notarization 미적용으로 plugin-updater 의 자동 업데이트가
+/// 동작하지 않는다. 대신 사용자가 "지금 확인" 을 누르면 이 함수로 GitHub 의 최신
+/// 태그를 직접 조회하고, 새 버전이면 release 페이지를 브라우저에서 열어준다 (이슈 #22).
+///
+/// lite(내부망) 빌드에는 없다 — 업데이트 확인 자체를 제공하지 않는다.
+#[cfg(feature = "online")]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GithubReleaseInfo {
+    /// "v2.5.21" 형태의 릴리즈 태그.
+    pub tag_name: String,
+    /// release 페이지 URL — 브라우저에서 열어 사용자 다운로드 유도용.
+    pub html_url: String,
+    /// 릴리즈 제목 (옵션).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 릴리즈 노트 (옵션).
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+/// lite(내부망) 빌드 스텁 — 업데이트 확인 경로가 없다.
+#[cfg(not(feature = "online"))]
+#[tauri::command]
+pub async fn check_github_release() -> Result<(), String> {
+    Err("이 설치본(내부망 전용)은 업데이트 확인을 지원하지 않습니다.".to_string())
+}
+
+#[cfg(feature = "online")]
+#[tauri::command]
+pub async fn check_github_release(repo: String) -> Result<GithubReleaseInfo, String> {
+    // 입력 검증 — repo 는 "owner/name" 형태. 영숫자 + - _ . / 만 허용.
+    if repo.is_empty()
+        || repo.len() > 100
+        || !repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        || repo.matches('/').count() != 1
+    {
+        return Err("잘못된 repo 식별자".to_string());
+    }
+
+    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+
+    // ureq는 동기 HTTP — async 커맨드에서 직접 부르면 DNS 지연/응답 스톨 동안
+    // tokio worker를 점유해 다른 IPC가 밀린다. telemetry.rs와 동일하게 spawn_blocking.
+    tokio::task::spawn_blocking(move || {
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(5)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(10)))
+            .build();
+        let agent = ureq::Agent::new_with_config(config);
+
+        let mut response = agent
+            .get(&url)
+            // GitHub API 는 User-Agent 가 없으면 403. 식별자에 버전 포함.
+            .header("User-Agent", "Docufinder-Updater")
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(404) => "릴리즈 정보를 찾을 수 없습니다.".to_string(),
+                ureq::Error::StatusCode(s) => format!("GitHub API 오류 (HTTP {})", s),
+                _ => "GitHub API 연결 실패 (네트워크 확인)".to_string(),
+            })?;
+
+        response
+            .body_mut()
+            .read_json::<GithubReleaseInfo>()
+            .map_err(|e| format!("GitHub API 응답 파싱 실패: {}", e))
+    })
+    .await
+    .map_err(|e| format!("태스크 실패: {}", e))?
+}
+
+/// 프론트엔드 에러를 Rust 로그 파일에 기록
+/// 로그 인젝션 방지: 입력 길이 제한 + 개행 문자 이스케이프
+#[tauri::command]
+pub async fn log_frontend_error(
+    level: String,
+    message: String,
+    stack: Option<String>,
+    source: Option<String>,
+) -> Result<(), String> {
+    const MAX_MESSAGE_LEN: usize = 4096;
+    const MAX_STACK_LEN: usize = 8192;
+    const MAX_SOURCE_LEN: usize = 256;
+
+    // 길이 제한 + control character 필터링 (로그/ANSI 인젝션 방지)
+    let sanitize = |s: &str, max: usize| -> String {
+        s.chars()
+            .take(max)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+    };
+
+    let source_tag = source
+        .as_deref()
+        .map(|s| sanitize(s, MAX_SOURCE_LEN))
+        .unwrap_or_else(|| "unknown".to_string());
+    let message = sanitize(&message, MAX_MESSAGE_LEN);
+    let stack_info = stack
+        .as_deref()
+        .map(|s| format!("\\n  Stack: {}", sanitize(s, MAX_STACK_LEN)))
+        .unwrap_or_default();
+
+    match level.as_str() {
+        "error" => tracing::error!("[FRONTEND:{}] {}{}", source_tag, message, stack_info),
+        "warn" => tracing::warn!("[FRONTEND:{}] {}{}", source_tag, message, stack_info),
+        _ => tracing::info!("[FRONTEND:{}] {}{}", source_tag, message, stack_info),
+    }
+    Ok(())
+}
+
+/// 로그 폴더를 파일 탐색기로 열기
+#[tauri::command]
+pub async fn open_log_dir(app_handle: AppHandle) -> Result<(), String> {
+    let data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("앱 데이터 경로를 가져올 수 없습니다: {}", e))?;
+    let logs_dir = data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+
+    let path_str = logs_dir.to_string_lossy().to_string();
+    open_with_default(&path_str)?;
+    Ok(())
+}
+
+/// 탐색기로 열기 — 파일 경로면 해당 파일을 선택(reveal)한 채로, 폴더 경로면 폴더만.
+#[tauri::command]
+pub async fn open_folder(path: String) -> Result<(), String> {
+    // 경로 검증
+    let canonical_path = validate_path(&path)?;
+
+    // 존재 확인 (파일/폴더 모두 허용)
+    if !canonical_path.exists() {
+        return Err("경로를 찾을 수 없습니다".to_string());
+    }
+
+    // 시스템 폴더 접근 차단
+    let path_lower = canonical_path.to_string_lossy().to_lowercase();
+    for pattern in crate::constants::BLOCKED_PATH_PATTERNS {
+        if path_lower.contains(&pattern.to_lowercase()) {
+            return Err("시스템 보호 폴더는 열 수 없습니다".to_string());
+        }
+    }
+
+    // canonicalize() 의 \\?\ 접두사를 dunce 기반 simplify 로 복원.
+    // 단순 strip 은 \\?\UNC\srv\share\... 를 UNC\srv\... 로 깨뜨려(매핑드라이브·
+    // 네트워크 폴더) explorer 가 경로를 해석 못 하고 기본 폴더만 열게 된다.
+    let path_str = crate::utils::network_path::simplify(&canonical_path)
+        .to_string_lossy()
+        .to_string();
+    // 파일 경로면 탐색기/Finder 에서 해당 파일을 선택(reveal)한 채로 폴더를 연다.
+    // 폴더 경로면(경로 표시줄 클릭 등) 기존대로 폴더만 연다.
+    if canonical_path.is_file() {
+        reveal_with_default(&path_str)?;
+    } else {
+        open_with_default(&path_str)?;
+    }
+    Ok(())
+}

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# macOS arm64 빌드 리소스 셋업 — node, kordoc, dylib 들을 src-tauri/resources/ 에 채운다.
+# - Node v20 darwin-arm64
+# - kordoc dist + node_modules (prod)
+# - ONNX Runtime v1.23.0 osx-arm64 dylib
+# - pdfium mac-arm64 dylib (스캔 PDF 래스터화)
+#
+# 이 셋은 .gitignore 대상이라 새 체크아웃에는 없다 — 안 돌리면 tauri build.rs 의 리소스
+# 검증이 "resource path ... doesn't exist" 로 실패한다(cargo test 포함).
+#
+# 사용:
+#   bash scripts/setup-macos-resources.sh
+#   KORDOC_DIR=/path/to/kordoc bash scripts/setup-macos-resources.sh
+set -euo pipefail
+
+NODE_VERSION="v20.18.0"
+ORT_VERSION="1.23.0"
+# pdfium (스캔/이미지 PDF 래스터화 fallback) — bblanchon/pdfium-binaries.
+# constants.rs 의 mac-arm64 SHA 와 반드시 동기화. 번들에 넣어 런타임 다운로드를 제거하면
+# 망분리 환경 기동 실패 + EDR(ZombieZERO 등) dropper 오탐을 함께 차단한다.
+PDFIUM_TAG="chromium/7920"
+PDFIUM_MAC_SHA256="c032aa59be58b0f12e41e76a8ef707e347b9841b0426446f646b2568d350ec4f"
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RES_DIR="$REPO_ROOT/src-tauri/resources"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+mkdir -p "$RES_DIR/onnxruntime" "$RES_DIR/paddleocr" "$RES_DIR/pdfium"
+
+echo "==> [1/4] Node ${NODE_VERSION} darwin-arm64"
+NODE_DEST="$RES_DIR/node"
+if [[ -x "$NODE_DEST" ]] && "$NODE_DEST" --version 2>/dev/null | grep -q "${NODE_VERSION}"; then
+    echo "  skip — already $("$NODE_DEST" --version)"
+else
+    NODE_TGZ="$TMP_DIR/node.tar.gz"
+    curl -fL --retry 3 -o "$NODE_TGZ" \
+        "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-darwin-arm64.tar.gz"
+    tar -xzf "$NODE_TGZ" -C "$TMP_DIR"
+    cp "$TMP_DIR/node-${NODE_VERSION}-darwin-arm64/bin/node" "$NODE_DEST"
+    chmod +x "$NODE_DEST"
+    echo "  -> $("$NODE_DEST" --version)"
+fi
+
+echo "==> [2/4] kordoc bundle"
+KORDOC_DEST="$RES_DIR/kordoc"
+KORDOC_SRC="${KORDOC_DIR:-}"
+if [[ -z "$KORDOC_SRC" ]]; then
+    for c in "$REPO_ROOT/../kordoc" "$HOME/workspace/kordoc"; do
+        if [[ -d "$c" ]]; then KORDOC_SRC="$(cd "$c" && pwd)"; break; fi
+    done
+fi
+if [[ -z "$KORDOC_SRC" || ! -d "$KORDOC_SRC" ]]; then
+    echo "ERROR: kordoc 소스 미발견. KORDOC_DIR=/path/to/kordoc 설정하거나 ../kordoc 에 두세요." >&2
+    exit 1
+fi
+echo "  source: $KORDOC_SRC"
+
+if [[ ! -d "$KORDOC_SRC/dist" ]]; then
+    # kordoc 은 npm 레포(package-lock.json) — pnpm 은 출력 없이 실패한다 (2026-07-03 실측)
+    echo "  building kordoc dist (npm ci + build)…"
+    (cd "$KORDOC_SRC" && npm ci --loglevel=error && npm run build)
+fi
+
+rm -rf "$KORDOC_DEST"
+mkdir -p "$KORDOC_DEST"
+# dist 내용 복사 (sourcemap/타입 정의 제외)
+# macOS BSD find 는 -exec cp --parents 미지원 → 디렉토리 구조 보존하며 직접 복사
+(cd "$KORDOC_SRC/dist" && find . -type f \
+    ! -name '*.map' ! -name '*.cts' ! -name 'index.d.ts' \
+    -print0 | while IFS= read -r -d '' f; do
+        mkdir -p "$KORDOC_DEST/$(dirname "$f")"
+        cp "$f" "$KORDOC_DEST/$f"
+    done)
+# 검증 — cli.js 가 복사됐어야 한다 (없으면 hwp/hwpx/docx/pdf 파싱 실패)
+[[ -f "$KORDOC_DEST/cli.js" ]] || { echo "ERROR: kordoc dist 복사 실패 ($KORDOC_DEST/cli.js 미존재)" >&2; exit 1; }
+
+# package.json (ESM)
+cat > "$KORDOC_DEST/package.json" <<'EOF'
+{"type":"module","name":"kordoc-bundle","private":true}
+EOF
+
+echo "  installing kordoc runtime deps (npm, prod-only)…"
+# kordoc dependencies — keep in sync with kordoc package.json `dependencies`
+# (markdown-it added in kordoc v2.7.0 for Print Renderer; missing it crashes cli.js at startup)
+(cd "$KORDOC_DEST" && npm install --omit=dev --no-package-lock --no-fund --no-audit --loglevel=error \
+    "@xmldom/xmldom" "commander" "jszip" "zod" "cfb" "markdown-it@^14" "pdfjs-dist@4" \
+    "@hyzyla/pdfium@^2" "onnxruntime-node@^1.24" "sharp@^0.34" "@huggingface/transformers@^4")
+
+# trim 불필요 파일
+# LICENSE*/NOTICE*/COPYING* 는 지우지 않는다 — 이 node_modules 는 배포본에 그대로
+# 번들되므로, MIT·Apache-2.0 등 대부분의 라이선스가 요구하는 저작권 고지가
+# 수령자에게 함께 전달되어야 한다.
+find "$KORDOC_DEST/node_modules" -type f \( \
+    -name '*.d.ts' -o -name '*.d.mts' -o -name '*.map' \
+    -o -name 'CHANGELOG*' -o -name 'tsconfig*' \) -delete 2>/dev/null || true
+find "$KORDOC_DEST/node_modules" -type f -name '*.md' \
+    ! -iname 'LICENSE*' ! -iname 'NOTICE*' ! -iname 'COPYING*' \
+    -delete 2>/dev/null || true
+
+echo "==> [3/4] ONNX Runtime ${ORT_VERSION} osx-arm64"
+DYLIB_DEST="$RES_DIR/onnxruntime/libonnxruntime.dylib"
+# -s (크기 > 0): CI 는 tauri 리소스 검증용으로 0바이트 placeholder 를 touch 한다
+# (.github/workflows/ci.yml). -f 로만 보면 그 빈 파일을 실물로 착각해 skip 하고,
+# 0바이트 dylib 이 그대로 번들에 들어간다.
+if [[ -s "$DYLIB_DEST" ]]; then
+    echo "  skip — already exists ($(du -h "$DYLIB_DEST" | cut -f1))"
+else
+    ORT_TGZ="$TMP_DIR/ort.tgz"
+    curl -fL --retry 3 -o "$ORT_TGZ" \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz"
+    tar -xzf "$ORT_TGZ" -C "$TMP_DIR"
+    SRC="$TMP_DIR/onnxruntime-osx-arm64-${ORT_VERSION}/lib/libonnxruntime.${ORT_VERSION}.dylib"
+    [[ -f "$SRC" ]] || { echo "ERROR: dylib 미발견: $SRC" >&2; exit 1; }
+    cp "$SRC" "$DYLIB_DEST"
+    # 자기 install_name 을 절대경로 → @rpath 로 (앱 번들 내부 로드용)
+    install_name_tool -id "@rpath/libonnxruntime.dylib" "$DYLIB_DEST" 2>/dev/null || true
+    echo "  -> $(du -h "$DYLIB_DEST" | cut -f1)"
+fi
+# install_name_tool 이 Mach-O 를 수정해 MS linker-signed 서명이 invalid 가 된다.
+# invalid 서명 dylib 은 dyld 가 로드 시점에 SIGKILL(CODESIGNING, Invalid Page) 로 죽이므로
+# ad-hoc 재서명으로 봉인. publish.yml 의 .app 재서명은 tauri build 가 이미 만든 dmg 에
+# 반영되지 않으므로 (dmg 안 앱은 빌드 시점 상태) 반드시 여기 — 번들에 들어가기 전 — 서명한다.
+# skip 경로(기존 파일)도 멱등 재서명해 과거에 받아둔 invalid 파일을 복구한다.
+codesign --force --sign - "$DYLIB_DEST"
+codesign --verify "$DYLIB_DEST" || { echo "ERROR: dylib 서명 검증 실패" >&2; exit 1; }
+
+echo "==> [4/4] pdfium ${PDFIUM_TAG} mac-arm64"
+PDFIUM_DEST="$RES_DIR/pdfium/libpdfium.dylib"
+# -s: 위 ONNX Runtime 과 같은 이유 — 0바이트 placeholder 를 실물로 착각하지 않는다.
+if [[ -s "$PDFIUM_DEST" ]]; then
+    echo "  skip — already exists ($(du -h "$PDFIUM_DEST" | cut -f1))"
+else
+    PDFIUM_TGZ="$TMP_DIR/pdfium-mac.tgz"
+    curl -fL --retry 3 -o "$PDFIUM_TGZ" \
+        "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-mac-arm64.tgz"
+    ACTUAL="$(shasum -a 256 "$PDFIUM_TGZ" | cut -d' ' -f1)"
+    [[ "$ACTUAL" == "$PDFIUM_MAC_SHA256" ]] || {
+        echo "ERROR: pdfium tgz SHA 불일치 — 기대 $PDFIUM_MAC_SHA256, 실제 $ACTUAL" >&2; exit 1; }
+    tar -xzf "$PDFIUM_TGZ" -C "$TMP_DIR"
+    SRC="$TMP_DIR/lib/libpdfium.dylib"
+    [[ -f "$SRC" ]] || { echo "ERROR: pdfium dylib 미발견: $SRC" >&2; exit 1; }
+    cp "$SRC" "$PDFIUM_DEST"
+    # onnxruntime dylib 과 동일 관례: 절대경로 install_name → @rpath, ad-hoc 재서명으로 봉인
+    install_name_tool -id "@rpath/libpdfium.dylib" "$PDFIUM_DEST" 2>/dev/null || true
+    echo "  -> $(du -h "$PDFIUM_DEST" | cut -f1)"
+fi
+codesign --force --sign - "$PDFIUM_DEST"
+codesign --verify "$PDFIUM_DEST" || { echo "ERROR: pdfium dylib 서명 검증 실패" >&2; exit 1; }
+
+echo ""
+echo "=== 완료 ==="
+echo "  $RES_DIR/node"
+echo "  $RES_DIR/kordoc/"
+echo "  $RES_DIR/onnxruntime/libonnxruntime.dylib"
+echo "  $RES_DIR/pdfium/libpdfium.dylib"

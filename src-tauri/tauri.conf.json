@@ -1,0 +1,96 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Finder",
+  "version": "3.8.1",
+  "identifier": "com.bosch.finder",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:5174",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Finder",
+        "visible": false,
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "minWidth": 800,
+        "minHeight": 600,
+        "create": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: asset: https://asset.localhost; connect-src 'self' https://github.com https://objects.githubusercontent.com https://api.github.com; object-src 'none'",
+      "capabilities": [
+        "default",
+        {
+          "identifier": "updater",
+          "description": "자동 업데이트 권한 — online(일반) 배포판 전용. capabilities/ 폴더에 두면 lite 빌드에서도 파일이 파싱돼 '플러그인 없음' 으로 빌드가 깨지므로 여기 인라인으로 둔다.",
+          "windows": ["main"],
+          "permissions": ["updater:default", "process:allow-restart"]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": false,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "models/kosimcse-roberta-multitask/model_int8.onnx",
+      "models/kosimcse-roberta-multitask/tokenizer.json",
+      "resources/node.exe",
+      "resources/kordoc/**/*",
+      "resources/paddleocr/det.onnx",
+      "resources/paddleocr/rec.onnx",
+      "resources/paddleocr/dict.txt",
+      "resources/onnxruntime/onnxruntime.dll",
+      "resources/pdfium/pdfium.dll",
+      "icons/tray-icon.png"
+    ],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "https://timestamp.digicert.com",
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      },
+      "nsis": {
+        "languages": [
+          "Korean",
+          "English"
+        ],
+        "displayLanguageSelector": false,
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/DukePan-AI/docu/releases/latest/download/latest.json"
+      ],
+      "dialog": false,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZEOENFMzc4MzE5OERERjEKUldUeDNaZ3hlT09NL1JqS0p5UHM5MURpRE5kK0xRVXpnRkg3Ums1c0JBTUN1LzkwNDhQYTY1VW0K",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

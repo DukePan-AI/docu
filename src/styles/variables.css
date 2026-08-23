@@ -1,0 +1,371 @@
+/* ============================================
+   DocuFinder Premium Design System
+   Warm Stone base + Green accent (#01AF7A, app icon) — Trustworthy yet State-of-the-Art
+   ============================================ */
+
+@theme {
+  /* 로컬 Pretendard + 시스템 폰트 폴백 */
+  --font-sans: 'Pretendard', 'Pretendard Variable', 'Malgun Gothic', system-ui, sans-serif;
+  --font-mono: 'Consolas', 'D2Coding', 'Fira Code', monospace;
+  /* Outfit: 영문 디스플레이용 (헤딩, 앱 이름, 배지 등) */
+  --font-display: 'Outfit Variable', 'Pretendard', system-ui, sans-serif;
+
+  /* Green accent palette (matches app icon #01AF7A) */
+  --color-primary-50: #ECFDF5;
+  --color-primary-100: #D1FAE5;
+  --color-primary-200: #A7F3D0;
+  --color-primary-300: #6EE7B7;
+  --color-primary-400: #34D399;
+  --color-primary-500: #10B981;
+  --color-primary-600: #01AF7A;
+  --color-primary-700: #019468;
+  --color-primary-800: #017A56;
+  --color-primary-900: #065F46;
+  --color-primary-950: #022C22;
+
+  --shadow-glass: 0 8px 32px 0 rgba(28, 25, 23, 0.06);
+}
+
+:root {
+  /* ============================================
+     Color Palette — Precision Craft
+     Warm Stone base + Green accent (#01AF7A)
+     ============================================ */
+
+  /* Backgrounds — warm ivory, not clinical white */
+  --color-bg-primary: #FAFAF7;
+  --color-bg-secondary: #FFFFFF;
+  --color-bg-tertiary: #F0EFEB;
+  --color-bg-subtle: #E7E5E4;
+
+  /* Sidebar */
+  --sidebar-width: 200px;
+  --sidebar-collapsed-width: 48px;
+  --color-sidebar-bg: #F5F5F0;
+  --color-sidebar-text: #1C1917;
+  --color-sidebar-muted: #78716C;
+  --color-sidebar-hover: rgba(28, 25, 23, 0.04);
+  --color-sidebar-active: rgba(1, 175, 122, 0.08);
+  --color-sidebar-border: #E7E5E4;
+  --color-sidebar-section: #A8A29E;
+
+  /* Typography — Stone palette */
+  --color-text-primary: #1C1917;
+  --color-text-secondary: #44403C;
+  --color-text-muted: #78716C;
+  --color-text-tertiary: #A8A29E;
+  --color-text-inverse: #FAFAF9;
+
+  /* Borders — warm stone */
+  --color-border: #E7E5E4;
+  --color-border-subtle: #F5F5F0;
+  --color-border-hover: #D6D3D1;
+
+  /* Accent — Bosch industrial blue */
+  --color-accent: #1E5AA8;
+  --color-accent-hover: #174D8B;
+  --color-accent-active: #123E73;
+  --color-accent-subtle: rgba(30, 90, 168, 0.08);
+  --color-accent-light: rgba(30, 90, 168, 0.10);
+  --color-accent-border: rgba(30, 90, 168, 0.22);
+  --color-accent-muted: rgba(30, 90, 168, 0.34);
+  --color-accent-glow: rgba(30, 90, 168, 0.22);
+
+  /* Secondary Accent — Bosch cool blue */
+  --color-accent-ai: #4A78C7;
+  --color-accent-ai-hover: #3566B2;
+  --color-accent-ai-subtle: rgba(74, 120, 199, 0.08);
+  --color-accent-ai-glow: rgba(74, 120, 199, 0.20);
+
+  /* Tertiary Accent — Amber (알림/하이라이트) */
+  --color-accent-warm: #D97706;
+  --color-accent-warm-subtle: rgba(217, 119, 6, 0.08);
+
+  /* Functional Colors */
+  --color-success: #059669;
+  --color-warning: #D97706;
+  --color-error: #DC2626;
+  --color-error-hover: #991B1B;
+  --color-error-rgb: 220, 38, 38;
+  --color-error-bg: rgba(220, 38, 38, 0.1);
+  --color-error-subtle: rgba(220, 38, 38, 0.08);
+  --color-error-border: rgba(220, 38, 38, 0.2);
+  --color-danger: var(--color-error);
+  --color-info: #0284C7;
+  --color-info-bg: rgba(2, 132, 199, 0.1);
+  --color-favorite: #FACC15;
+  --color-favorite-bg: rgba(250, 204, 21, 0.15);
+  --color-warning-bg: rgba(217, 119, 6, 0.2);
+
+  /* Backdrop */
+  --color-backdrop: rgba(0, 0, 0, 0.4);
+
+  /* Component Aliases */
+  --color-primary-rgb: 1, 175, 122;
+  --color-primary-light: #10C48E;
+  --color-accent-bg: var(--color-accent-subtle);
+  --bg-primary: var(--color-bg-primary);
+  --text-primary: var(--color-text-primary);
+
+  /* Highlighting - Content */
+  --color-highlight-bg: rgba(251, 191, 36, 0.25);
+  --color-highlight-text: inherit;
+  --color-highlight-border: rgba(251, 191, 36, 0.6);
+  --color-highlight-refine-bg: rgba(74, 222, 128, 0.2);
+  --color-highlight-refine-text: inherit;
+  --color-highlight-refine-border: rgba(74, 222, 128, 0.5);
+
+  /* Highlighting - Filename */
+  --color-highlight-filename-bg: rgba(251, 146, 60, 0.25);
+  --color-highlight-filename-text: inherit;
+  --color-highlight-filename-border: rgba(251, 146, 60, 0.7);
+
+  /* File Type Colors */
+  --color-file-hwpx: #7C3AED;
+  --color-file-docx: #2563EB;
+  --color-file-pptx: #D97706;
+  --color-file-xlsx: #16A34A;
+  --color-file-pdf: #DC2626;
+  --color-file-txt: #57534E;
+
+  /* File Type Backgrounds */
+  --color-file-hwpx-bg: rgba(124, 58, 237, 0.04);
+  --color-file-docx-bg: rgba(37, 99, 235, 0.04);
+  --color-file-pptx-bg: rgba(217, 119, 6, 0.04);
+  --color-file-xlsx-bg: rgba(22, 163, 74, 0.04);
+  --color-file-pdf-bg: rgba(220, 38, 38, 0.04);
+  --color-file-txt-bg: rgba(87, 83, 78, 0.03);
+
+  /* Shadows — warm-tinted */
+  --shadow-sm: 0 1px 2px 0 rgba(28, 25, 23, 0.04);
+  --shadow-md: 0 1px 3px 0 rgba(28, 25, 23, 0.06), 0 1px 2px -1px rgba(28, 25, 23, 0.06);
+  --shadow-lg: 0 4px 6px -1px rgba(28, 25, 23, 0.07), 0 2px 4px -2px rgba(28, 25, 23, 0.04);
+  --shadow-xl: 0 10px 15px -3px rgba(28, 25, 23, 0.08), 0 4px 6px -4px rgba(28, 25, 23, 0.04);
+  --shadow-card: 0 1px 3px rgba(28, 25, 23, 0.04), 0 0 0 1px rgba(28, 25, 23, 0.03);
+  --shadow-card-hover: 0 4px 12px rgba(28, 25, 23, 0.08), 0 0 0 1px rgba(1, 175, 122, 0.12);
+  --shadow-inner: inset 0 1px 2px 0 rgba(28, 25, 23, 0.04);
+
+  /* Radii */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+
+  /* Type Scale (~1.2 ratio, 15px base) — lg/xl/2xl 사이 공백 메워 본문~제목 위계 연속화 */
+  --text-2xs: 0.6875rem;  /* 11px — 버전, 최소 메타 */
+  --text-xs: 0.75rem;     /* 12px — 배지, 타임스탬프 */
+  --text-sm: 0.8125rem;   /* 13px — 보조 텍스트, 경로 */
+  --text-base: 0.9375rem; /* 15px — 본문 기본 */
+  --text-md: 1rem;        /* 16px — 검색바 입력 */
+  --text-lg: 1.0625rem;   /* 17px — 본문 강조 */
+  --text-xl: 1.3125rem;   /* 21px — 서브섹션 헤딩 */
+  --text-2xl: 1.625rem;   /* 26px — 페이지 타이틀 */
+  --text-hero: 2.75rem;   /* 44px — 히어로 */
+
+  /* Layout Constraints */
+  /* 창이 넓어지면 콘텐츠도 함께 확장(좁은 창 820px 가독성 유지 → 넓은 창 최대 1400px) */
+  --content-max-width: clamp(820px, 62vw, 1400px);
+
+  /* Micro-typography & Fluid Space */
+  --space-fluid-screen: clamp(2rem, 5vw, 4rem);
+  --tracking-hero: -0.04em;
+  --tracking-body: 0.01em;
+  --glass-blur: blur(16px);
+  --bg-noise: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+
+  /* Easing Curves */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out-sine: cubic-bezier(0.37, 0, 0.63, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Transitions */
+  --transition-fast: 120ms var(--ease-out-expo);
+  --transition-normal: 200ms var(--ease-out-expo);
+  --transition-spring: 400ms var(--ease-spring);
+
+  /* ============================================
+     v3.0 Warm Premium Layer (추가 — 기존 토큰 비파괴)
+     전략적 그린 강조 + 입체 depth + 곡률 언어 통일
+     ============================================ */
+  /* 전략적 accent — CTA/히어로 등 "한 곳"에만 사용 (그린 분산 규율 유지) */
+  --gradient-accent: linear-gradient(135deg, #10C48E 0%, #01AF7A 55%, #019468 100%);
+  --gradient-accent-soft: linear-gradient(135deg, rgba(1, 175, 122, 0.09), rgba(1, 175, 122, 0.015));
+  --gradient-surface-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0));
+  /* 입체 depth — warm tint 유지하되 또렷한 lift (인터랙티브 표면 전용) */
+  --shadow-premium: 0 1px 2px rgba(28, 25, 23, 0.05), 0 10px 28px -12px rgba(28, 25, 23, 0.16);
+  --shadow-premium-accent: 0 2px 4px rgba(28, 25, 23, 0.04), 0 12px 28px -10px rgba(1, 175, 122, 0.22);
+  /* 카드 곡률 언어 통일 — 결과/칩/패널 카드류 기본값 */
+  --radius-card: var(--radius-xl); /* 12px */
+
+  /* ============================================
+     Chart & Diff Tokens (컴포넌트 하드코딩 hex 수렴)
+     ============================================ */
+  /* 문서 비교(diff) — 추가/삭제. 기능색 별칭이라 다크 값은 success/error 를 따라 자동 전환 */
+  --diff-add: var(--color-success);
+  --diff-del: var(--color-error);
+  /* OCR 지표 (인덱싱 리포트) */
+  --color-ocr: #8B5CF6;
+  /* 통계 차트 — 비문서 확장자 식별색 (언어·포맷 브랜드색).
+     명도 중간대 브랜드색이라 라이트/다크 공통값 사용 (기존 렌더와 동일) */
+  --chart-js: #F7DF1E;
+  --chart-ts: #3178C6;
+  --chart-json: #8B8B8B;
+  --chart-yaml: #CB171E;
+  --chart-toml: #9C4221;
+  --chart-py: #3776AB;
+  --chart-rs: #DEA584;
+  --chart-go: #00ADD8;
+  --chart-java: #B07219;
+  --chart-c: #555555;
+  --chart-cpp: #F34B7D;
+  --chart-cs: #178600;
+  --chart-rb: #701516;
+  --chart-php: #4F5D95;
+  --chart-sh: #89E051;
+  --chart-lua: #000080;
+  --chart-html: #E34C26;
+  --chart-css: #563D7C;
+  --chart-scss: #C6538C;
+  --chart-vue: #41B883;
+  --chart-image: #0EA5E9;
+  --chart-svg: #FFB13B;
+  --chart-video: #EC4899;
+  --chart-audio: #A855F7;
+  --chart-archive: #F59E0B;
+}
+
+/* ============================================
+   Dark Mode Theme
+   ============================================ */
+.dark {
+  /* Backgrounds — warm dark, NOT blue-tinted */
+  --color-bg-primary: #111113;
+  --color-bg-secondary: #1A1A1F;
+  --color-bg-tertiary: #242429;
+  --color-bg-subtle: #2E2E33;
+
+  /* Sidebar */
+  --color-sidebar-bg: #0D0D0F;
+  --color-sidebar-text: #E7E5E4;
+  --color-sidebar-muted: #A8A29E;
+  --color-sidebar-hover: rgba(255, 255, 255, 0.05);
+  --color-sidebar-active: rgba(16, 196, 142, 0.12);
+  --color-sidebar-border: rgba(255, 255, 255, 0.06);
+  --color-sidebar-section: #78716C;
+
+  /* Typography */
+  --color-text-primary: #FAFAF9;
+  --color-text-secondary: #D6D3D1;
+  --color-text-muted: #A8A29E;
+  --color-text-tertiary: #78716C;
+  --color-text-inverse: #1C1917;
+
+  /* Borders */
+  --color-border: rgba(255, 255, 255, 0.08);
+  --color-border-subtle: rgba(255, 255, 255, 0.04);
+  --color-border-hover: rgba(255, 255, 255, 0.14);
+
+  /* Accent — brighter green for dark */
+  --color-accent: #10C48E;
+  --color-accent-hover: #34D9A5;
+  --color-accent-active: #01AF7A;
+  --color-accent-subtle: rgba(16, 196, 142, 0.10);
+  --color-accent-light: rgba(16, 196, 142, 0.10);
+  --color-accent-border: rgba(16, 196, 142, 0.25);
+  --color-accent-muted: rgba(16, 196, 142, 0.35);
+  --color-accent-glow: rgba(16, 196, 142, 0.25);
+
+  /* Secondary Accent — Indigo (AI/시맨틱 기능) */
+  --color-accent-ai: #818CF8;
+  --color-accent-ai-hover: #6366F1;
+  --color-accent-ai-subtle: rgba(129, 140, 248, 0.12);
+  --color-accent-ai-glow: rgba(129, 140, 248, 0.25);
+
+  /* Tertiary Accent — Amber */
+  --color-accent-warm: #FBBF24;
+  --color-accent-warm-subtle: rgba(251, 191, 36, 0.12);
+
+  /* Functional — brighter variants for dark contrast (match -rgb/file-type values) */
+  --color-success: #34D399;
+  --color-warning: #FBBF24;
+  --color-error: #F87171;
+  --color-error-hover: #B91C1C;
+  --color-error-rgb: 248, 113, 113;
+  --color-error-bg: rgba(248, 113, 113, 0.1);
+  --color-error-subtle: rgba(248, 113, 113, 0.08);
+  --color-error-border: rgba(248, 113, 113, 0.25);
+  --color-danger: var(--color-error);
+  --color-info: #38BDF8;
+  --color-info-bg: rgba(56, 189, 248, 0.1);
+  --color-favorite: #FDE047;
+  --color-favorite-bg: rgba(253, 224, 71, 0.15);
+  --color-warning-bg: rgba(217, 119, 6, 0.2);
+  --color-backdrop: rgba(0, 0, 0, 0.6);
+  --color-primary-rgb: 16, 196, 142;
+  --color-primary-light: #34D9A5;
+  --color-accent-bg: rgba(16, 196, 142, 0.12);
+  --bg-primary: var(--color-bg-primary);
+  --text-primary: var(--color-text-primary);
+
+  /* Highlighting - Content */
+  --color-highlight-bg: rgba(253, 224, 71, 0.2);
+  --color-highlight-text: inherit;
+  --color-highlight-border: rgba(253, 224, 71, 0.5);
+  --color-highlight-refine-bg: rgba(74, 222, 128, 0.15);
+  --color-highlight-refine-text: inherit;
+  --color-highlight-refine-border: rgba(74, 222, 128, 0.4);
+
+  /* Highlighting - Filename */
+  --color-highlight-filename-bg: rgba(251, 146, 60, 0.2);
+  --color-highlight-filename-text: inherit;
+  --color-highlight-filename-border: rgba(251, 146, 60, 0.5);
+
+  /* File Type Colors */
+  --color-file-hwpx: #A78BFA;
+  --color-file-docx: #60A5FA;
+  --color-file-pptx: #FBBF24;
+  --color-file-xlsx: #34D399;
+  --color-file-pdf: #F87171;
+  --color-file-txt: #A8A29E;
+
+  /* File Type Backgrounds */
+  --color-file-hwpx-bg: rgba(167, 139, 250, 0.08);
+  --color-file-docx-bg: rgba(96, 165, 250, 0.08);
+  --color-file-pptx-bg: rgba(251, 191, 36, 0.08);
+  --color-file-xlsx-bg: rgba(52, 211, 153, 0.08);
+  --color-file-pdf-bg: rgba(248, 113, 113, 0.08);
+  --color-file-txt-bg: rgba(168, 162, 158, 0.08);
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 2px 8px -1px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px -4px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 16px 40px -8px rgba(0, 0, 0, 0.5);
+  --shadow-card: 0 1px 4px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --shadow-card-hover: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(16, 196, 142, 0.2);
+  --shadow-inner: inset 0 1px 3px 0 rgba(0, 0, 0, 0.25);
+
+  /* v3.0 Warm Premium Layer — dark 대응 */
+  --gradient-accent: linear-gradient(135deg, #34D9A5 0%, #10C48E 55%, #01AF7A 100%);
+  --gradient-accent-soft: linear-gradient(135deg, rgba(16, 196, 142, 0.12), rgba(16, 196, 142, 0.02));
+  --gradient-surface-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0));
+  --shadow-premium: 0 2px 8px -2px rgba(0, 0, 0, 0.4), 0 12px 32px -10px rgba(0, 0, 0, 0.5);
+  --shadow-premium-accent: 0 2px 8px -2px rgba(0, 0, 0, 0.4), 0 12px 32px -10px rgba(16, 196, 142, 0.28);
+}
+
+/* ============================================
+   Global Reset & Base Styles
+   ============================================ */
+html,
+body,
+#root {
+  height: 100%;
+  font-family: var(--font-sans);
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  /* App-like feel */
+}

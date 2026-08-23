@@ -1,0 +1,165 @@
+/* ============================================
+   Animations & Keyframes
+   ============================================ */
+
+/* Animations */
+@keyframes modal-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.animate-modal-enter {
+  animation: modal-enter 0.2s var(--ease-out-expo);
+}
+
+@keyframes modal-exit {
+  from {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.97) translateY(6px);
+  }
+}
+
+.animate-modal-exit {
+  animation: modal-exit 0.13s ease-in forwards; /* 진입(0.2s)의 65% */
+}
+
+@keyframes backdrop-enter {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes backdrop-exit {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+.animate-backdrop-enter {
+  animation: backdrop-enter 0.2s var(--ease-out-expo) forwards;
+}
+
+.animate-backdrop-exit {
+  animation: backdrop-exit 0.13s ease-in forwards;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+.animate-search-bar {
+  animation: indeterminate 1.2s var(--ease-in-out-sine) infinite;
+}
+
+.animate-fade-in {
+  animation: fadeIn var(--transition-normal) forwards;
+}
+
+.animate-scale-in {
+  animation: scaleIn var(--transition-fast) forwards;
+}
+
+/* Staggered Animation Helper — result items fade in sequentially */
+.stagger-item {
+  opacity: 0;
+  animation: slideUp 0.3s var(--ease-out-expo) forwards;
+}
+
+/* Preview panel overlay slide-in */
+@keyframes previewSlideIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.preview-slide-in {
+  animation: previewSlideIn 0.2s var(--ease-out-expo) forwards;
+}
+
+/* Skeleton shimmer effect */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-bg-subtle) 25%,
+    var(--color-bg-tertiary) 37%,
+    var(--color-bg-subtle) 63%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s var(--ease-in-out-sine) infinite;
+}
+
+/* 컨텍스트 메뉴 열기 애니메이션 */
+@keyframes ctx-menu-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+.ctx-menu-animate {
+  animation: ctx-menu-in 0.12s var(--ease-out-expo);
+  transform-origin: top left;
+}
+
+/* ============================================
+   저사양 환경 최적화 (애니메이션 축소)
+   ============================================ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* 기능적 스피너는 reduced-motion에서도 동작해야 함 */
+  .animate-spin {
+    animation: spin 1.5s linear infinite !important;
+  }
+}

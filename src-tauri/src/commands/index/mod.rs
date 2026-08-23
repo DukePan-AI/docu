@@ -1,0 +1,458 @@
+//! Index Commands - Thin Layer (Clean Architecture)
+//!
+//! Tauri commands that delegate to IndexService and FolderService.
+
+mod batch;
+mod data;
+mod file;
+mod folder;
+mod init;
+
+pub use batch::*;
+pub use data::*;
+pub use file::*;
+pub use folder::*;
+pub use init::*;
+
+use crate::application::dto::indexing::{
+    AddFolderResult, FolderStats, IndexStatus, WatchedFolderInfo,
+};
+use crate::error::{ApiError, ApiResult};
+use crate::indexer::pipeline::FtsIndexingProgress;
+use crate::indexer::vector_worker::{VectorIndexingProgress, VectorIndexingStatus};
+use crate::AppContainer;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// 인덱싱 명령에서 공통으로 필요한 설정/서비스 번들
+pub(super) struct IndexingContext {
+    pub(super) service: crate::application::services::IndexService,
+    pub(super) include_subfolders: bool,
+    pub(super) semantic_available: bool,
+    pub(super) semantic_enabled: bool,
+    pub(super) intensity: super::settings::IndexingIntensity,
+    pub(super) max_file_size_mb: u64,
+    pub(super) db_path: PathBuf,
+    pub(super) exclude_dirs: Vec<String>,
+}
+
+/// 단일 lock 스코프에서 인덱싱에 필요한 모든 설정/서비스를 추출
+pub(super) fn extract_indexing_context(
+    state: &State<'_, RwLock<AppContainer>>,
+) -> ApiResult<IndexingContext> {
+    let container = state.read()?;
+    let settings = container.get_settings();
+    let mut dirs: Vec<String> = crate::constants::DEFAULT_EXCLUDED_DIRS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    dirs.extend(settings.exclude_dirs.clone());
+    Ok(IndexingContext {
+        service: container.index_service(),
+        include_subfolders: settings.include_subfolders,
+        semantic_available: container.is_semantic_available(),
+        semantic_enabled: settings.semantic_search_enabled,
+        intensity: settings.indexing_intensity.clone(),
+        max_file_size_mb: settings.max_file_size_mb,
+        db_path: container.db_path.clone(),
+        exclude_dirs: dirs,
+    })
+}
+
+pub(super) fn should_auto_vector(
+    _ctx: &IndexingContext,
+    _was_cancelled: bool,
+    _indexed_count: usize,
+    _skip_drive_root: bool,
+) -> bool {
+    // 벡터 인덱싱은 AI RAG 전용 → 자동 시작 비활성화
+    // 사용자가 명시적으로 start_vector_indexing 커맨드를 호출할 때만 실행
+    false
+}
+
+/// 인덱싱 완료 후 벡터 자동 시작 여부 판단 + 실행
+pub(super) fn maybe_start_auto_vector(
+    ctx: &IndexingContext,
+    app_handle: AppHandle,
+    was_cancelled: bool,
+    indexed_count: usize,
+    skip_drive_root: bool,
+    state: Option<&State<'_, RwLock<AppContainer>>>,
+) -> bool {
+    if !should_auto_vector(ctx, was_cancelled, indexed_count, skip_drive_root) {
+        return false;
+    }
+
+    // 이미 paused 상태가 아니면 여기서 먼저 멈춘다.
+    if let Some(s) = state {
+        pause_watching(s);
+    }
+
+    let vector_callback = create_vector_progress_callback(app_handle, true);
+    match ctx
+        .service
+        .start_vector_indexing(Some(vector_callback), Some(ctx.intensity.clone()))
+    {
+        Ok(true) => true,
+        Ok(false) | Err(_) => {
+            if let Some(s) = state {
+                resume_watching(s, &ctx.db_path);
+            }
+            false
+        }
+    }
+}
+
+/// 파일 감시 일시 중지 (인덱싱 중 DB 동시 접근 방지)
+pub(super) fn pause_watching(state: &State<'_, RwLock<AppContainer>>) {
+    if let Ok(container) = state.read() {
+        if let Ok(wm) = container.get_watch_manager() {
+            if let Ok(mut wm) = wm.write() {
+                wm.pause();
+            }
+        }
+    }
+}
+
+/// 파일 감시 재개 (DB의 watched_folders 목록으로 전체 재등록)
+/// 재개 전 WAL checkpoint 수행 (대량 인덱싱 후 WAL 파일 크기 관리)
+pub(super) fn resume_watching(state: &State<'_, RwLock<AppContainer>>, db_path: &std::path::Path) {
+    crate::db::wal_checkpoint(db_path);
+    if let Ok(container) = state.read() {
+        if let Ok(wm) = container.get_watch_manager() {
+            if let Ok(mut wm) = wm.write() {
+                if let Ok(conn) = crate::db::get_connection(db_path) {
+                    if let Ok(folders) = crate::db::get_watched_folders(&conn) {
+                        let existing_folders: Vec<String> = folders
+                            .into_iter()
+                            .filter(|folder| Path::new(folder).exists())
+                            .collect();
+                        wm.resume_with_folders(&existing_folders);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 프론트엔드 이벤트용 인덱싱 진행률
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct IndexingProgress {
+    pub(super) phase: String,
+    pub(super) total_files: usize,
+    pub(super) processed_files: usize,
+    pub(super) current_file: Option<String>,
+    pub(super) folder_path: String,
+    pub(super) error: Option<String>,
+}
+
+// ============================================
+// FTS Progress Callback Helper
+// ============================================
+
+/// 인덱싱 실패 시 종단 진행률 이벤트.
+/// 파이프라인이 종단 이벤트("completed"/"cancelled") 없이 Err로 끝나면 프론트
+/// 상태바가 마지막 phase("scanning" 등)에 고착된다 — 명시적 "error" phase로 닫는다.
+pub(super) fn emit_error_progress(app_handle: &AppHandle, folder_path: &str, error: &str) {
+    let _ = app_handle.emit(
+        "indexing-progress",
+        &IndexingProgress {
+            phase: "error".to_string(),
+            total_files: 0,
+            processed_files: 0,
+            current_file: None,
+            folder_path: folder_path.to_string(),
+            error: Some(error.to_string()),
+        },
+    );
+}
+
+pub(super) fn create_fts_progress_callback(
+    app_handle: AppHandle,
+) -> Box<dyn Fn(FtsIndexingProgress) + Send + Sync> {
+    Box::new(move |progress: FtsIndexingProgress| {
+        let legacy_progress = IndexingProgress {
+            phase: progress.phase,
+            total_files: progress.total_files,
+            processed_files: progress.processed_files,
+            current_file: progress.current_file,
+            folder_path: progress.folder_path,
+            error: None,
+        };
+        if let Err(e) = app_handle.emit("indexing-progress", &legacy_progress) {
+            tracing::warn!("Failed to emit progress: {}", e);
+        }
+    })
+}
+
+pub(super) fn create_vector_progress_callback(
+    app_handle: AppHandle,
+    resume_on_complete: bool,
+) -> Arc<dyn Fn(VectorIndexingProgress) + Send + Sync> {
+    // 워커 종료를 정확히 1회만 재개하도록 가드 — 재개가 두 번 실행되면 pause refcount 가
+    // 음수로 새어 인덱싱 중 감시가 켜지는 역결함이 될 수 있다.
+    let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Arc::new(move |progress: VectorIndexingProgress| {
+        if let Err(e) = app_handle.emit("vector-indexing-progress", &progress) {
+            tracing::warn!("Failed to emit vector progress: {}", e);
+        }
+        // 워커 종료(완료·취소 무관) 시 파일 감시 재개 — 취소된 워커는 is_complete=true 를 안
+        // 보내므로 여기서 놓치면 pause refcount 가 고착돼 세션 내내 감시·동기화가 죽는다.
+        // finished 는 종료 이벤트에서만 true, resumed 가드로 정확히 1회만 실행 (dworker-1).
+        if progress.finished
+            && resume_on_complete
+            && !resumed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let state = app_handle.state::<RwLock<AppContainer>>();
+            let db_path = state.read().ok().map(|c| c.db_path.clone());
+            if let Some(db_path) = db_path {
+                resume_watching(&state, &db_path);
+            }
+        }
+    })
+}
+
+/// 매핑 드라이브/UNC 경로의 응답성을 5초 timeout 으로 사전 검증.
+///
+/// SMB 매핑이 끊긴 / 서버가 응답 안 하는 / 자격증명 만료 상태에서 후속 walkdir 가
+/// 무한 hang 하는 사고를 차단 (이슈 #24 사용자 보고 — 매핑 드라이브 추가 시
+/// "알림 누른 뒤 조용한대"). 로컬 경로면 ping 생략 후 Ok.
+pub(super) async fn probe_network_path(path: &Path) -> ApiResult<()> {
+    if !crate::utils::cloud_detect::is_network_path(path) {
+        return Ok(());
+    }
+    let probe = path.to_path_buf();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || std::fs::read_dir(&probe).map(|_| ())),
+    )
+    .await;
+    match result {
+        Err(_) => Err(ApiError::InvalidPath(format!(
+            "네트워크 폴더 응답 없음 ({}): 5초 내에 응답이 없습니다. 드라이브 매핑이 끊겼거나 서버가 응답하지 않을 수 있습니다.",
+            path.display()
+        ))),
+        Ok(Err(join_err)) => Err(ApiError::InvalidPath(format!(
+            "네트워크 폴더 검사 실패 ({}): {}",
+            path.display(),
+            join_err
+        ))),
+        Ok(Ok(Err(io_err))) => {
+            // os error 5(액세스 거부)는 매핑 드라이브 자체보다 프로세스 토큰 문제인
+            // 경우가 많다 — 앱이 관리자 권한으로 실행되면 매핑 드라이브가 비관리자
+            // 로그온 세션에만 묶여 보이지 않는다(이슈 #29 SMB Y:\). 진단 힌트를 덧붙인다.
+            // 경로는 canonicalize_best_effort 에서 이미 UNC 변환을 시도한 뒤다. 그럼에도
+            // os error 5 면, elevated 여부로 원인을 갈라 안내한다(이슈 #29).
+            let hint = if io_err.raw_os_error() == Some(5) {
+                if crate::utils::elevation::is_elevated() {
+                    "\n\n앱이 관리자 권한으로 실행 중입니다. 관리자 세션에는 일반 세션에서 연결한 매핑 네트워크 드라이브가 보이지 않습니다. 앱을 일반 권한으로 다시 실행하거나, 폴더를 `\\\\서버\\공유` 형태의 UNC 경로로 직접 추가해 보세요."
+                } else {
+                    "\n\n액세스가 거부되었습니다. 네트워크 자격 증명이 만료됐거나 공유 폴더 접근 권한이 없을 수 있습니다. 탐색기에서 해당 폴더가 열리는지 확인한 뒤 다시 시도하세요."
+                }
+            } else {
+                ""
+            };
+            Err(ApiError::InvalidPath(format!(
+                "네트워크 폴더 접근 실패 ({}): {}{}",
+                path.display(),
+                io_err,
+                hint
+            )))
+        }
+        Ok(Ok(Ok(()))) => Ok(()),
+    }
+}
+
+/// 경로 정규화 — 실패 시 원본 경로로 fallback (best-effort).
+///
+/// 매핑 드라이브→UNC 치환 + dunce 정규화 + 실패 시 폴백 로직은
+/// `utils::network_path::canonicalize_best_effort` 로 통일했다(commands·application
+/// 양 레이어 공유, 이슈 #29). 실제 접근성은 `probe_network_path` 가 별도로 검증한다.
+pub(super) fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    crate::utils::network_path::canonicalize_best_effort(path)
+}
+
+pub(super) fn stop_file_watching(
+    state: &State<'_, RwLock<AppContainer>>,
+    path: &Path,
+) -> ApiResult<()> {
+    let container = state.read()?;
+    if let Ok(wm) = container.get_watch_manager() {
+        if let Ok(mut wm) = wm.write() {
+            let _ = wm.unwatch(path);
+        }
+    }
+    Ok(())
+}
+
+/// FilenameCache 갱신 (인덱싱 완료 후 호출)
+pub(super) fn refresh_filename_cache(state: &State<'_, RwLock<AppContainer>>) {
+    if let Ok(container) = state.read() {
+        match container.load_filename_cache() {
+            Ok(count) => tracing::info!("FilenameCache refreshed: {} entries", count),
+            Err(e) => tracing::warn!("Failed to refresh FilenameCache: {}", e),
+        }
+    }
+}
+
+pub(super) fn build_result_message(
+    result: &crate::indexer::pipeline::FolderIndexResult,
+    was_cancelled: bool,
+    semantic_available: bool,
+    is_reindex: bool,
+) -> String {
+    let action = if is_reindex {
+        "재인덱싱"
+    } else {
+        "인덱싱"
+    };
+
+    if was_cancelled {
+        format!("{}이 취소되었습니다", action)
+    } else if result.failed_count > 0 {
+        format!(
+            "{} 파일 {} 완료, {} 실패{}",
+            result.indexed_count,
+            action,
+            result.failed_count,
+            if semantic_available {
+                " (시맨틱 검색 준비 중...)"
+            } else {
+                ""
+            }
+        )
+    } else if semantic_available {
+        format!(
+            "{} 파일 {} 완료 (시맨틱 검색 준비 중...)",
+            result.indexed_count, action
+        )
+    } else {
+        format!("{} 파일 {} 완료", result.indexed_count, action)
+    }
+}
+
+pub(super) fn log_indexing_errors(errors: &[String]) {
+    if !errors.is_empty() {
+        tracing::warn!("Indexing errors ({}):", errors.len());
+        for (i, err) in errors.iter().take(10).enumerate() {
+            tracing::warn!("  {}: {}", i + 1, err);
+        }
+        if errors.len() > 10 {
+            tracing::warn!("  ... and {} more errors", errors.len() - 10);
+        }
+    }
+}
+
+// ============================================
+// Index Status Commands
+// ============================================
+
+/// 인덱스 상태 조회
+#[tauri::command]
+pub async fn get_index_status(state: State<'_, RwLock<AppContainer>>) -> ApiResult<IndexStatus> {
+    let (service, model_available, filename_cache) = {
+        let container = state.read()?;
+        (
+            container.index_service(),
+            container.is_semantic_available(),
+            container.get_filename_cache(),
+        )
+    };
+    let mut status = service.get_status().await.map_err(ApiError::from)?;
+    // OnceCell 초기화 여부가 아닌 모델 파일 존재 여부로 판단
+    status.semantic_available = model_available;
+    status.filename_cache_truncated = filename_cache.is_truncated();
+    Ok(status)
+}
+
+/// 벡터 인덱싱 상태 조회
+#[tauri::command]
+pub async fn get_vector_indexing_status(
+    state: State<'_, RwLock<AppContainer>>,
+) -> ApiResult<VectorIndexingStatus> {
+    let service = {
+        let container = state.read()?;
+        container.index_service()
+    };
+    service.get_vector_status().map_err(ApiError::from)
+}
+
+// ============================================
+// Manual Vector Indexing
+// ============================================
+
+/// 수동 벡터 인덱싱 시작
+#[tauri::command]
+pub async fn start_vector_indexing(
+    app_handle: AppHandle,
+    state: State<'_, RwLock<AppContainer>>,
+) -> ApiResult<()> {
+    tracing::info!("Manual vector indexing requested");
+
+    let (service, semantic_enabled, intensity, db_path) = {
+        let container = state.read()?;
+        let settings = container.get_settings();
+        (
+            container.index_service(),
+            settings.semantic_search_enabled,
+            settings.indexing_intensity.clone(),
+            container.db_path.clone(),
+        )
+    };
+
+    if !semantic_enabled {
+        return Err(ApiError::SemanticSearchDisabled);
+    }
+
+    if service
+        .get_vector_status()
+        .map_err(ApiError::from)?
+        .is_running
+    {
+        return Ok(());
+    }
+
+    pause_watching(&state);
+
+    let vector_callback = create_vector_progress_callback(app_handle, true);
+    match service.start_vector_indexing(Some(vector_callback), Some(intensity)) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            resume_watching(&state, &db_path);
+            Ok(())
+        }
+        Err(e) => {
+            resume_watching(&state, &db_path);
+            Err(ApiError::from(e))
+        }
+    }
+}
+
+// ============================================
+// Cancel Commands
+// ============================================
+
+/// 인덱싱 취소
+#[tauri::command]
+pub async fn cancel_indexing(state: State<'_, RwLock<AppContainer>>) -> ApiResult<()> {
+    tracing::info!("Cancelling indexing...");
+    let service = {
+        let container = state.read()?;
+        container.index_service()
+    };
+    service.cancel_indexing();
+    Ok(())
+}
+
+/// 벡터 인덱싱 취소
+#[tauri::command]
+pub async fn cancel_vector_indexing(state: State<'_, RwLock<AppContainer>>) -> ApiResult<()> {
+    tracing::info!("Cancelling vector indexing...");
+    let service = {
+        let container = state.read()?;
+        container.index_service()
+    };
+    service.cancel_vector_indexing().map_err(ApiError::from)
+}

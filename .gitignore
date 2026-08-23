@@ -1,0 +1,82 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Tauri
+src-tauri/target/
+
+# Database (local)
+*.db
+*.db-journal
+
+# Models (large files - ~140MB)
+models/
+src-tauri/models/
+
+# Certificates (private keys)
+*.pfx
+*.p12
+
+# Test
+coverage/
+nul
+
+# Lock file (pnpm 전용 프로젝트)
+package-lock.json
+
+# Test target directories
+src-tauri/target-test*/
+src-tauri/wix/vc_redist.x64.exe
+
+# Bundled runtime (빌드 시 스크립트로 생성)
+src-tauri/resources/node.exe
+src-tauri/resources/node
+src-tauri/resources/kordoc/
+src-tauri/resources/onnxruntime/libonnxruntime.dylib
+# pdfium mac dylib — setup-macos-resources.sh 가 생성 (Windows pdfium.dll 은 git-track)
+src-tauri/resources/pdfium/libpdfium.dylib
+# WebView2 fixed runtime — CI 빌드 시 setup-webview2-runtime.ps1 가 생성 (~500MB)
+src-tauri/webview2-runtime/
+src-tauri/resources/webview2-runtime/
+
+# Promo video (Remotion)
+promo-video/node_modules/
+promo-video/out/
+
+# Claude Code (personal workspace)
+.claude/
+
+# Tauri signing keys
+.tauri/
+
+# Unrelated projects
+claude-global-config/
+chrisbot-clone/
+
+# Internal docs
+docs/plans/

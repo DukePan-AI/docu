@@ -1,0 +1,71 @@
+{
+  "name": "anything",
+  "version": "3.8.1",
+  "description": "로컬 문서 검색 앱 - Everything 대항마",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--no-proxy-server --disable-background-networking --disable-features=msSmartScreenProtection&& tauri dev",
+    "tauri:dev:mac": "tauri dev",
+    "download-model": "powershell -ExecutionPolicy Bypass -File scripts/download-model.ps1",
+    "download-vcredist": "powershell -ExecutionPolicy Bypass -File scripts/download-vcredist.ps1",
+    "bundle-kordoc": "powershell -ExecutionPolicy Bypass -File scripts/bundle-kordoc.ps1",
+    "setup-mac-resources": "bash scripts/setup-macos-resources.sh",
+    "tauri:build": "pnpm run download-vcredist && pnpm run download-model && pnpm run bundle-kordoc && tauri build",
+    "tauri:build:mac": "pnpm run setup-mac-resources && tauri build --target aarch64-apple-darwin",
+    "dev:lite": "set VITE_LITE=1&& vite",
+    "build:lite": "set VITE_LITE=1&& tsc && vite build",
+    "bundle-kordoc:lite": "powershell -ExecutionPolicy Bypass -File scripts/bundle-kordoc.ps1 -Lite",
+    "tauri:dev:lite": "tauri dev --config src-tauri/tauri.lite.conf.json --features custom-protocol -- --no-default-features",
+    "tauri:build:lite": "pnpm run bundle-kordoc:lite && tauri build --config src-tauri/tauri.lite.conf.json --features custom-protocol -- --no-default-features"
+  },
+  "keywords": [
+    "document",
+    "search",
+    "hwpx",
+    "tauri"
+  ],
+  "author": "Chris",
+  "license": "BUSL-1.1",
+  "packageManager": "pnpm@10.20.0",
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.18",
+    "@tauri-apps/cli": "^2.9.6",
+    "@types/react": "^19.2.8",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "png-to-ico": "^2.1.8",
+    "sharp": "^0.33.5",
+    "tailwindcss": "^4.1.18",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "rollup": ">=4.59.0",
+      "picomatch": ">=4.0.4"
+    }
+  },
+  "dependencies": {
+    "@crabnebula/tauri-plugin-drag": "^2.1.0",
+    "@fontsource-variable/outfit": "^5.2.8",
+    "@tauri-apps/api": "^2.9.1",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "@tauri-apps/plugin-process": "^2.3.0",
+    "@tauri-apps/plugin-updater": "^2.9.0",
+    "clsx": "^2.1.1",
+    "katex": "^0.16.45",
+    "lucide-react": "^0.469.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
+  }
+}

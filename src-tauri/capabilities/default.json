@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/capabilities/2",
+  "identifier": "default",
+  "description": "DocuFinder default capabilities - 최소 권한 원칙",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-ask",
+    "drag:default"
+  ],
+  "_note": "파일/폴더 열기는 커스텀 커맨드(file.rs)로 처리하며 경로+확장자 검증 완료. shell:allow-open 제거하여 공격 표면 축소. 자동 업데이트 권한은 updater.json 으로 분리 — lite(내부망) 빌드는 그 파일을 활성화하지 않는다."
+}

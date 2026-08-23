@@ -1,0 +1,116 @@
+import { useState } from "react";
+import { invokeWithTimeout, IPC_TIMEOUT } from "../../../utils/invokeWithTimeout";
+import { Button } from "../../ui/Button";
+import { SettingsToggle } from "../SettingsToggle";
+import { useUpdater } from "../../../hooks/useUpdater";
+import { UpdateModal } from "../../updater/UpdateModal";
+import { getErrorMessage } from "../../../types/error";
+import { isMac } from "../../../utils/platform";
+import { IS_LITE } from "../../../utils/buildFlavor";
+import type { TabProps } from "./types";
+
+interface DiagnosticsTabProps extends TabProps {
+  setError?: (msg: string | null) => void;
+}
+
+export function DiagnosticsTab({ settings, onChange, setError }: DiagnosticsTabProps) {
+  // 업데이트 수동 체크 (자동 체크는 App.tsx에서 담당)
+  const updater = useUpdater(false);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const handleCheckUpdate = async () => {
+    setUpdateModalOpen(true);
+    await updater.checkForUpdate();
+  };
+
+  return (
+    <div className="space-y-3">
+      {/* lite: 업데이터 플러그인·Telegram 리포트가 빠진 빌드 — 왜 항목이 없는지 한 줄로 알린다 */}
+      {IS_LITE && (
+        <p className="text-xs leading-relaxed" style={{ color: "var(--color-text-muted)" }}>
+          내부망 전용 설치본입니다 — 자동 업데이트와 오류 자동 전송은 포함되어 있지 않습니다.
+          오류는 아래 로그 폴더에만 기록됩니다.
+        </p>
+      )}
+
+      {/* 업데이트 — lite: 업데이터 플러그인이 없어 호출이 항상 실패한다 */}
+      {!IS_LITE && (
+      <div>
+        <h3 className="text-sm font-semibold mb-2" style={{ color: "var(--color-text-primary)" }}>업데이트</h3>
+        <div className="flex items-center justify-between">
+          <div>
+            <label className="text-sm font-medium" style={{ color: "var(--color-text-secondary)" }}>
+              {isMac ? "업데이트 확인 (수동 설치)" : "자동 업데이트 확인"}
+            </label>
+            <p className="text-xs" style={{ color: "var(--color-text-muted)" }}>
+              {isMac
+                ? "GitHub 에서 새 버전을 확인하고 다운로드 페이지를 안내합니다 (자동 설치는 macOS Notarization 미적용으로 비활성)"
+                : "앱 시작 시 + 6시간마다 자동 체크 · 새 버전 발견 시 알림"}
+            </p>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleCheckUpdate}
+            isLoading={updater.state.phase === "checking"}
+            disabled={updater.state.phase === "checking" || updater.state.phase === "downloading" || updater.state.phase === "installing"}
+          >
+            지금 확인
+          </Button>
+        </div>
+      </div>
+      )}
+
+      {/* 오류 리포트 — lite: 백엔드가 error_reporting_enabled 를 false 로 고정해 토글이 무의미 */}
+      {!IS_LITE && (
+      <div className="border-t pt-3" style={{ borderColor: "var(--color-border)" }}>
+        <h3 className="text-sm font-semibold mb-2" style={{ color: "var(--color-text-primary)" }}>오류 리포트</h3>
+        <SettingsToggle
+          label="오류 자동 전송"
+          description="앱에서 오류 발생 시 개발자에게 자동 리포트 · 파일 경로 익명화, 문서 내용/검색어 전송 안 함"
+          checked={settings.error_reporting_enabled ?? true}
+          onChange={(v) => onChange("error_reporting_enabled", v)}
+        />
+      </div>
+      )}
+
+      {/* 로그 */}
+      <div className="border-t pt-3" style={{ borderColor: "var(--color-border)" }}>
+        <h3 className="text-sm font-semibold mb-2" style={{ color: "var(--color-text-primary)" }}>로그</h3>
+        <div className="flex items-center justify-between">
+          <div>
+            <label className="text-sm font-medium" style={{ color: "var(--color-text-secondary)" }}>로그 폴더</label>
+            <p className="text-xs" style={{ color: "var(--color-text-muted)" }}>오류 로그 (7일 보존)</p>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={async () => {
+              try {
+                await invokeWithTimeout("open_log_dir", undefined, IPC_TIMEOUT.FILE_ACTION);
+              } catch (err) {
+                setError?.(`로그 폴더 열기 실패: ${getErrorMessage(err)}`);
+              }
+            }}
+          >
+            폴더 열기
+          </Button>
+        </div>
+      </div>
+
+      {!IS_LITE && (
+        <UpdateModal
+          isOpen={updateModalOpen}
+          onClose={() => {
+            setUpdateModalOpen(false);
+            updater.dismiss();
+          }}
+          state={updater.state}
+          onInstall={updater.downloadAndInstall}
+          onRestart={updater.restart}
+          onCancel={updater.cancel}
+          onOpenReleasePage={updater.openReleasePage}
+        />
+      )}
+    </div>
+  );
+}

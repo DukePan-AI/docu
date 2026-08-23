@@ -1,0 +1,327 @@
+/** 단일 검색 결과 */
+export interface SearchResult {
+  file_path: string;
+  file_name: string;
+  chunk_index: number;
+  content_preview: string;
+  score: number;
+  /** 정규화된 신뢰도 (0-100) */
+  confidence: number;
+  /** 검색 매칭 타입 */
+  match_type: SearchResultMatchType;
+  highlight_ranges: [number, number][];
+  page_number: number | null;
+  start_offset: number;
+  /** 위치 힌트 (XLSX: "Sheet1!행1-50", PDF: "페이지 3", HWPX: "섹션 2" 등) */
+  location_hint: string | null;
+  /** FTS5 snippet (하이라이트 마커 포함) */
+  snippet?: string;
+  /** 파일 수정 시간 (Unix timestamp, 초) */
+  modified_at: number | null;
+  /** 파일 크기 (바이트). 파일명 검색 결과에만 채워짐 */
+  size?: number | null;
+  /** 같은 경로에 원본 HWP 파일이 존재하는 HWPX */
+  has_hwp_pair?: boolean;
+  /** 해당 파일의 전체 청크 개수 (히트맵 절대 스케일용, 0이면 미제공) */
+  total_chunks?: number;
+  /** Document Lineage Graph: 같은 논리 문서의 버전 그룹 ID */
+  lineage_id?: string;
+  /** Lineage 내 역할 — "canonical" | "version" */
+  lineage_role?: "canonical" | "version";
+  /** 파일명에서 추출한 버전 라벨 — "최최종", "v3" 등 */
+  version_label?: string;
+  /** 같은 lineage에 속한 전체 파일 수 (자기 자신 포함). 2 이상이면 UI 뱃지 표시 */
+  version_count?: number;
+  /** 복사 시 글자가 깨지는 문서(PDF CID/ToUnicode 누락, HWP PUA 커스텀폰트)로 감지됨 */
+  garbled?: boolean;
+}
+
+/** Lineage 버전 항목 (펼치기용) */
+export interface LineageVersion {
+  file_path: string;
+  file_name: string;
+  lineage_role: "canonical" | "version" | null;
+  version_label: string | null;
+  modified_at: number | null;
+  size: number | null;
+}
+
+/** Lineage 건강도 항목 */
+export interface LineageHealthEntry {
+  lineage_id: string;
+  canonical_name: string;
+  canonical_path: string;
+  file_count: number;
+  total_size: number;
+  status: "healthy" | "cluttered" | "ambiguous" | "abandoned";
+  issues: string[];
+  stale_count: number;
+}
+
+/** Lineage 건강도 리포트 */
+export interface LineageHealthReport {
+  total_lineages: number;
+  multi_version_lineages: number;
+  problem_lineages: LineageHealthEntry[];
+  unassigned_files: number;
+}
+
+/** 청크 레벨 diff 항목 */
+export interface ChunkDiffEntry {
+  kind: "added" | "removed" | "modified" | "unchanged";
+  a_index: number | null;
+  b_index: number | null;
+  a_preview: string | null;
+  b_preview: string | null;
+  similarity: number | null;
+  page_number: number | null;
+  location_hint: string | null;
+  /** unchanged 시 바이트 수준 동일 여부 */
+  byte_identical?: boolean | null;
+}
+
+/** 버전 간 Diff 응답 */
+export interface LineageDiffResponse {
+  a_path: string;
+  b_path: string;
+  a_total_chunks: number;
+  b_total_chunks: number;
+  changes: ChunkDiffEntry[];
+  unchanged_count: number;
+}
+
+/** 검색 매칭 타입 */
+export type SearchResultMatchType = "keyword" | "semantic" | "hybrid" | "filename";
+
+/** 그룹화된 검색 결과 (파일별) */
+export interface GroupedSearchResult {
+  file_path: string;
+  file_name: string;
+  chunks: SearchResult[];
+  /** 가장 높은 신뢰도 */
+  top_confidence: number;
+  /** 총 매칭 수 */
+  total_matches: number;
+}
+
+/** 결과 뷰 모드 */
+export type ViewMode = "flat" | "grouped";
+
+/** 검색 응답 */
+export interface SearchResponse {
+  results: SearchResult[];
+  total_count: number;
+  search_time_ms: number;
+}
+
+/** 검색 모드 (hybrid/semantic은 내부 RAG 전용, UI 미노출) */
+export type SearchMode = "keyword" | "semantic" | "hybrid" | "filename";
+
+/** 키워드 매칭 모드 (AND / OR / EXACT) */
+export type KeywordMatchMode = "and" | "or" | "exact";
+
+/** 키워드 매칭 모드 정보 */
+export interface KeywordMatchModeInfo {
+  value: KeywordMatchMode;
+  label: string;
+  desc: string;
+}
+
+/** 키워드 매칭 모드 목록 */
+export const KEYWORD_MATCH_MODES: KeywordMatchModeInfo[] = [
+  { value: "and", label: "모두 포함", desc: "모든 키워드가 포함된 문서" },
+  { value: "or", label: "하나 이상", desc: "키워드 중 하나라도 포함된 문서" },
+  { value: "exact", label: "정확히 일치", desc: "입력한 구문이 그대로 포함된 문서" },
+];
+
+/** 최근 검색 기록 */
+export interface RecentSearch {
+  query: string;
+  timestamp: number;  // Unix timestamp (ms)
+}
+
+/** 검색 모드 정보 */
+export interface SearchModeInfo {
+  value: SearchMode;
+  label: string;
+  desc: string;
+}
+
+/** 검색 모드 목록 (UI에 노출되는 것만) */
+export const SEARCH_MODES: SearchModeInfo[] = [
+  { value: "keyword", label: "키워드", desc: "FTS5 전문검색" },
+  { value: "filename", label: "파일명", desc: "파일명 검색" },
+];
+
+// =====================
+// 필터/정렬 관련 타입
+// =====================
+
+/** 정렬 옵션 ("size"는 향후 파일 크기 정렬 기능용으로 예약) */
+export type SortOption = "relevance" | "confidence" | "date_desc" | "date_asc" | "name" | "size";
+
+/** 파일 타입 필터 (개별 확장자) */
+export type FileTypeFilter = "hwpx" | "docx" | "pptx" | "xlsx" | "pdf" | "txt";
+
+/** 날짜 범위 필터 */
+export type DateRangeFilter = "all" | "today" | "week" | "month" | "quarter" | "half" | "year" | `custom:${string}`;
+
+/** 검색 필터 상태 */
+export interface SearchFilters {
+  sortBy: SortOption;
+  /** 선택된 확장자들 (빈 배열 = 전체) */
+  fileTypes: FileTypeFilter[];
+  dateRange: DateRangeFilter;
+  keywordOnly: boolean;
+  /** 파일명 검색 결과 제외 */
+  excludeFilename: boolean;
+  /** 검색 범위 (null = 전체, string = 폴더 경로 prefix) */
+  searchScope: string | null;
+}
+
+/** 기본 필터 값 */
+export const DEFAULT_FILTERS: SearchFilters = {
+  sortBy: "relevance",
+  fileTypes: [],
+  dateRange: "all",
+  keywordOnly: false,
+  excludeFilename: false,
+  searchScope: null,
+};
+
+/** 정렬 옵션 목록 */
+export const SORT_OPTIONS: { value: SortOption; label: string }[] = [
+  { value: "relevance", label: "관련도순" },
+  { value: "confidence", label: "신뢰도순" },
+  { value: "date_desc", label: "최신순" },
+  { value: "date_asc", label: "오래된순" },
+  { value: "name", label: "이름순" },
+];
+
+/** 파일 타입 필터 목록 */
+export const FILE_TYPE_OPTIONS: { value: FileTypeFilter; label: string }[] = [
+  { value: "hwpx", label: "HWPX" },
+  { value: "docx", label: "DOCX" },
+  { value: "pptx", label: "PPTX" },
+  { value: "xlsx", label: "XLSX" },
+  { value: "pdf", label: "PDF" },
+  { value: "txt", label: "TXT" },
+];
+
+/** 날짜 범위 필터 목록 */
+export const DATE_RANGE_OPTIONS: { value: DateRangeFilter; label: string }[] = [
+  { value: "all", label: "기간 없음" },
+  { value: "today", label: "오늘" },
+  { value: "week", label: "7일" },
+  { value: "month", label: "30일" },
+  { value: "quarter", label: "90일" },
+  { value: "half", label: "6개월" },
+  { value: "year", label: "1년" },
+];
+
+// =====================
+// 검색 패러다임 (v2.5)
+// =====================
+
+/** 검색 패러다임: 즉시(실시간) vs 자연어(Enter 실행) vs 질문(AI RAG) */
+export type SearchParadigm = "instant" | "natural" | "question";
+
+/** NL 파서 결과 (자연어 검색 모드) */
+export interface ParsedQueryInfo {
+  keywords: string;
+  exclude_keywords: string[];
+  date_filter: { type: string; value?: number } | null;
+  file_type: string | null;
+  filename_filter: string | null;
+  original_query: string;
+  parse_log: string[];
+}
+
+/** 스마트(자연어) 검색 응답 */
+export interface SmartSearchResponse {
+  results: SearchResult[];
+  total_count: number;
+  search_time_ms: number;
+  parsed_query: ParsedQueryInfo;
+}
+
+// =====================
+// AI RAG (v2.6)
+// =====================
+
+/** 검증가능한 인용 — `[출처N]`의 N(doc_num) ↔ 실제 문서 위치/앵커 매핑 */
+export interface SourceRef {
+  /** `[출처: N]`의 N (1-based). source_files[N-1]과 동일 문서 */
+  doc_num: number;
+  file_path: string;
+  file_name: string;
+  /** 첫 위치정보 보유 청크의 페이지 (kordoc 경로에선 null일 수 있음) */
+  page_number: number | null;
+  /** 위치 힌트 ("Sheet1!행1-50", "페이지 3" 등) */
+  location_hint: string | null;
+  /** 미리보기 점프용 앵커 텍스트 목록 (각 청크 앞부분, 검색 순서) */
+  anchors: string[];
+}
+
+/** AI 분석 응답 */
+export interface AiAnalysis {
+  answer: string;
+  source_files: string[];
+  /** 검증가능 인용 매핑 (구버전 응답엔 없을 수 있어 optional) */
+  sources?: SourceRef[];
+  processing_time_ms: number;
+  model: string;
+  tokens_used: TokenUsage | null;
+}
+
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+// =====================
+// 문서 요약 (v2.4)
+// =====================
+
+/** 요약 문장 */
+export interface SummarySentence {
+  text: string;
+  score: number;
+  original_index: number;
+  page_number: number | null;
+  location_hint: string | null;
+}
+
+/** 요약 응답 */
+export interface SummaryResponse {
+  sentences: SummarySentence[];
+  total_sentences: number;
+  generation_time_ms: number;
+}
+
+// =====================
+// 통계 대시보드 (v2.3)
+// =====================
+
+export interface StatEntry {
+  label: string;
+  count: number;
+}
+
+export interface FileEntry {
+  path: string;
+  name: string;
+  value: number;
+}
+
+export interface DocumentStatistics {
+  total_files: number;
+  indexed_files: number;
+  total_size: number;
+  file_types: StatEntry[];
+  years: StatEntry[];
+  folders: StatEntry[];
+  recent_files: FileEntry[];
+  largest_files: FileEntry[];
+}

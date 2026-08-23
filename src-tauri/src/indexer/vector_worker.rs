@@ -1,0 +1,822 @@
+//! 2단계 벡터 인덱싱 워커
+//!
+//! FTS 인덱싱 완료 후 백그라운드에서 벡터 임베딩 수행
+//! - 파이프라인 병렬화: DB 프리페치 + 임베딩 동시 진행
+//! - 파일 경계와 무관하게 32청크씩 배치 임베딩 (T2-4 — 작은 파일 다수에서도 배치 유지)
+//! - 주기적 진행률 이벤트 emit
+//! - 취소 지원
+
+use crate::commands::settings::IndexingIntensity;
+use crate::db::{self, PendingChunk};
+use crate::embedder::Embedder;
+use crate::search::vector::VectorIndex;
+use crossbeam_channel::{bounded, RecvTimeoutError};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// 벡터 인덱싱 배치 크기
+/// 32로 축소: Embedder Mutex 점유 시간 ~400ms로 제한 → 검색 쿼리 인터리빙 가능
+const EMBEDDING_BATCH_SIZE: usize = 32;
+
+/// 벡터 인덱스 저장 주기 (청크 수) - I/O 최적화를 위해 1000으로 증가
+const SAVE_INTERVAL: usize = 1000;
+
+/// 벡터 인덱스 저장 주기 (시간) — 작은 파일들이 천천히 처리되어
+/// SAVE_INTERVAL 청크에 도달하지 못해도 주기적으로 영속화
+const SAVE_INTERVAL_SECS: u64 = 30;
+
+/// 프리페치 버퍼 크기 (배치 2개 분량 — 파이프라인 유지 + 메모리 절약)
+const PREFETCH_BUFFER_SIZE: usize = 2;
+
+/// 프리페치된 배치 데이터
+struct PrefetchedBatch {
+    file_id: i64,
+    file_path: String,
+    chunks: Vec<PendingChunk>,
+}
+
+/// 벡터 인덱싱 상태
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct VectorIndexingStatus {
+    pub is_running: bool,
+    pub total_chunks: usize,
+    pub processed_chunks: usize,
+    pub pending_chunks: usize,
+    pub current_file: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 벡터 인덱싱 진행률 이벤트
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VectorIndexingProgress {
+    pub total_chunks: usize,
+    pub processed_chunks: usize,
+    pub current_file: Option<String>,
+    pub is_complete: bool,
+    /// 워커 종료(완료·취소 무관) 이벤트 여부 — is_complete 는 '성공 완료'만 true 라 취소를
+    /// 구분하지 못해, 취소 시 감시 재개(pause 해제)가 누락됐다. finished 는 종료 시 항상 true 로
+    /// 콜백이 종료 1회를 확실히 감지해 pause refcount 누수를 막는다 (dworker-1).
+    pub finished: bool,
+}
+
+/// 진행률 콜백 타입
+pub type VectorProgressCallback = Arc<dyn Fn(VectorIndexingProgress) + Send + Sync>;
+
+/// 벡터 인덱싱 워커
+pub struct VectorWorker {
+    thread: Option<JoinHandle<()>>,
+    cancel_flag: Arc<AtomicBool>,
+    status: Arc<RwLock<VectorIndexingStatus>>,
+}
+
+impl VectorWorker {
+    /// 새 VectorWorker 생성
+    pub fn new() -> Self {
+        Self {
+            thread: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(RwLock::new(VectorIndexingStatus::default())),
+        }
+    }
+
+    /// 벡터 인덱싱 시작
+    pub fn start(
+        &mut self,
+        db_path: PathBuf,
+        embedder: Arc<Embedder>,
+        vector_index: Arc<VectorIndex>,
+        progress_callback: Option<VectorProgressCallback>,
+        intensity: Option<IndexingIntensity>,
+    ) -> Result<(), String> {
+        // 이미 실행 중이면 에러
+        if self.is_running() {
+            return Err("Vector indexing already running".to_string());
+        }
+
+        // 이전 스레드가 남아있으면 안전하게 종료 대기
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+
+        // 취소 플래그 리셋
+        self.cancel_flag.store(false, Ordering::Release);
+
+        // 상태 초기화
+        if let Ok(mut status) = self.status.write() {
+            *status = VectorIndexingStatus {
+                is_running: true,
+                total_chunks: 0,
+                processed_chunks: 0,
+                pending_chunks: 0,
+                current_file: None,
+                error: None,
+            };
+        }
+
+        let cancel_flag = self.cancel_flag.clone();
+        let status = self.status.clone();
+        let intensity = intensity.unwrap_or(IndexingIntensity::Balanced);
+
+        // 백그라운드 스레드 시작 (catch_unwind로 panic 안전성 보장)
+        let handle = std::thread::spawn(move || {
+            // 스레드 우선순위 설정 (Windows)
+            #[cfg(target_os = "windows")]
+            set_thread_priority(&intensity);
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_vector_indexing(
+                    &db_path,
+                    &embedder,
+                    &vector_index,
+                    &cancel_flag,
+                    &status,
+                    progress_callback,
+                    &intensity,
+                )
+            }));
+
+            // 완료/에러 상태 업데이트 (panic 포함)
+            if let Ok(mut s) = status.write() {
+                s.is_running = false;
+                match result {
+                    Ok(Err(e)) => s.error = Some(e),
+                    Err(_) => {
+                        tracing::error!("Vector indexing thread panicked");
+                        s.error = Some("Vector indexing thread panicked".to_string());
+                    }
+                    Ok(Ok(())) => {}
+                }
+            }
+        });
+
+        self.thread = Some(handle);
+        Ok(())
+    }
+
+    /// 현재 상태 조회
+    pub fn get_status(&self) -> VectorIndexingStatus {
+        self.status.read().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// 실행 중 여부
+    pub fn is_running(&self) -> bool {
+        self.status.read().map(|s| s.is_running).unwrap_or(false)
+    }
+
+    /// 취소 요청
+    pub fn cancel(&self) {
+        self.cancel_flag.store(true, Ordering::Release);
+    }
+
+    /// 스레드 종료 대기
+    pub fn join(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Default for VectorWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for VectorWorker {
+    fn drop(&mut self) {
+        // 자동 정리: 취소 요청 후 스레드 종료 대기
+        self.cancel();
+        self.join();
+    }
+}
+
+/// 벡터 인덱싱 실행 (파이프라인 병렬화)
+///
+/// 구조: [DB 프리페치 스레드] --배치--> [메인 스레드: 임베딩 + 저장]
+/// DB I/O와 임베딩이 병렬로 진행되어 처리량 향상
+fn run_vector_indexing(
+    db_path: &Path,
+    embedder: &Arc<Embedder>,
+    vector_index: &Arc<VectorIndex>,
+    cancel_flag: &Arc<AtomicBool>,
+    status: &Arc<RwLock<VectorIndexingStatus>>,
+    progress_callback: Option<VectorProgressCallback>,
+    intensity: &IndexingIntensity,
+) -> Result<(), String> {
+    let conn = db::get_connection(db_path).map_err(|e| format!("DB connection failed: {}", e))?;
+
+    // 통계 조회
+    let stats =
+        db::get_vector_indexing_stats(&conn).map_err(|e| format!("Failed to get stats: {}", e))?;
+
+    // 벡터 인덱스에 실제 존재하는 청크 수 (DB 마킹과 무관하게 실제 임베딩된 수)
+    let vectors_in_index = vector_index.chunk_count();
+
+    // 누적 진행률: DB 마킹 완료 + 벡터 인덱스에만 존재하는 청크 모두 포함
+    // DB에서 completed와 vector index 크기 중 큰 값 사용 (불일치 대응)
+    let base_processed = stats.completed_chunks.max(vectors_in_index);
+    let total_chunks = base_processed + stats.pending_chunks;
+
+    tracing::info!(
+        "[VectorWorker] Starting pipeline. {} pending, {} already done (db={}, index={}), {} total",
+        stats.pending_chunks,
+        base_processed,
+        stats.completed_chunks,
+        vectors_in_index,
+        total_chunks
+    );
+
+    // 상태 업데이트 (누적 기준)
+    if let Ok(mut s) = status.write() {
+        s.total_chunks = total_chunks;
+        s.processed_chunks = base_processed;
+        s.pending_chunks = stats.pending_chunks;
+    }
+
+    // 진행률 알림 (base_processed를 더해 누적 진행률 표시)
+    let send_progress =
+        |processed: usize, current_file: Option<&str>, is_complete: bool, finished: bool| {
+            if let Some(ref cb) = progress_callback {
+                cb(VectorIndexingProgress {
+                    total_chunks,
+                    processed_chunks: base_processed + processed,
+                    current_file: current_file.map(|s| s.to_string()),
+                    is_complete,
+                    finished,
+                });
+            }
+        };
+
+    // 파이프라인 채널 생성
+    let (batch_tx, batch_rx) = bounded::<PrefetchedBatch>(PREFETCH_BUFFER_SIZE);
+
+    // 프리페치 스레드용 DB 경로 복사
+    let prefetch_db_path = db_path.to_path_buf();
+    let prefetch_cancel = cancel_flag.clone();
+
+    // 프리페치 스레드 시작
+    let prefetch_handle = std::thread::spawn(move || {
+        run_prefetch_thread(prefetch_db_path, batch_tx, prefetch_cancel);
+    });
+
+    // 메인 루프: 임베딩 + 저장
+    let mut st = EmbedState {
+        base_processed,
+        total_chunks,
+        processed: 0,
+        last_save: 0,
+        last_save_time: Instant::now(),
+        pending_mark_file_ids: Vec::new(),
+        tracker: CompletionTracker::default(),
+    };
+    // T2-4: 파일 경계를 넘어 EMBEDDING_BATCH_SIZE 를 채우는 청크 스트림 버퍼.
+    // 작은 파일(청크 1~5개)들이 파일 단위 미니배치로 임베딩되어 배치 효율을 잃던
+    // 것을, 여러 파일의 청크를 모아 32개 단위로 임베딩한다. 파일 완료 마킹은
+    // CompletionTracker 가 청크 집계로 판정한다 (save-then-mark 일관성은 기존과 동일).
+    let mut chunk_buffer: Vec<(i64, PendingChunk)> = Vec::new();
+    let recv_timeout = Duration::from_millis(100);
+    // 취소 플래그: 최종 is_complete 이벤트를 정확히 내보내기 위한 추적
+    let mut was_cancelled = false;
+
+    loop {
+        // 취소 확인 (버퍼에 남은 미임베딩 청크는 폐기 — pending 으로 남아 다음 세션 재개)
+        if cancel_flag.load(Ordering::Acquire) {
+            tracing::info!("[VectorWorker] Cancelled");
+            was_cancelled = true;
+            send_progress(st.processed, None, false, false);
+            break;
+        }
+
+        match batch_rx.recv_timeout(recv_timeout) {
+            Ok(prefetched) => {
+                let current_file = Some(prefetched.file_path.as_str());
+
+                // 상태 업데이트 (누적)
+                if let Ok(mut s) = status.write() {
+                    s.current_file = Some(prefetched.file_path.clone());
+                    s.processed_chunks = base_processed + st.processed;
+                    s.pending_chunks = total_chunks.saturating_sub(base_processed + st.processed);
+                }
+
+                send_progress(st.processed, current_file, false, false);
+
+                // 파일 완료 판정용 등록 (배치가 파일 경계를 넘으므로 청크 집계로 판정)
+                let total_chunks_in_file = prefetched.chunks.len();
+                st.tracker.add_file(
+                    prefetched.file_id,
+                    prefetched.file_path.clone(),
+                    total_chunks_in_file,
+                );
+
+                // 이미 벡터 인덱스에 존재하는 청크 필터링 (재시작 시 스킵)
+                let mut skipped_in_file = 0usize;
+                for chunk in prefetched.chunks {
+                    if vector_index.contains_chunk(chunk.chunk_id) {
+                        skipped_in_file += 1;
+                    } else {
+                        chunk_buffer.push((prefetched.file_id, chunk));
+                    }
+                }
+
+                if skipped_in_file > 0 {
+                    tracing::debug!(
+                        "[VectorWorker] File '{}': {} chunks already in index, {} to embed",
+                        prefetched.file_path,
+                        skipped_in_file,
+                        total_chunks_in_file - skipped_in_file
+                    );
+                    // 스킵된 청크도 처리된 것으로 카운트. 전량 스킵 파일은 여기서
+                    // 완료 판정되어 마킹 버퍼로 (기존의 즉시 마킹 → flush 경유로 통일:
+                    // 해당 청크는 이미 저장된 인덱스에 있으므로 crash 시에도 안전).
+                    st.processed += skipped_in_file;
+                    if let Some(done) = st.tracker.record(prefetched.file_id, skipped_in_file, 0) {
+                        route_completion(done, &mut st.pending_mark_file_ids);
+                    }
+                }
+
+                // 버퍼가 배치 크기를 채우는 동안 임베딩 (파일 경계 무관)
+                while chunk_buffer.len() >= EMBEDDING_BATCH_SIZE {
+                    if cancel_flag.load(Ordering::Acquire) {
+                        was_cancelled = true;
+                        break;
+                    }
+                    let batch: Vec<(i64, PendingChunk)> =
+                        chunk_buffer.drain(..EMBEDDING_BATCH_SIZE).collect();
+                    process_embed_batch(
+                        batch,
+                        &conn,
+                        embedder,
+                        vector_index,
+                        status,
+                        intensity,
+                        &mut st,
+                    );
+                }
+                if was_cancelled {
+                    continue; // 루프 상단의 취소 처리(로그·진행률·break)로
+                }
+
+                // 시간 기준 저장: 청크 수가 SAVE_INTERVAL에 못 미쳐도 주기적 영속화
+                if (st.processed > st.last_save || !st.pending_mark_file_ids.is_empty())
+                    && st.last_save_time.elapsed() >= Duration::from_secs(SAVE_INTERVAL_SECS)
+                {
+                    flush_save_and_mark(&conn, vector_index, &mut st.pending_mark_file_ids);
+                    st.last_save = st.processed;
+                    st.last_save_time = Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // 프리페치가 조용한 동안(다음 파일 로드 지연·빈 파일 구간) 부분 배치
+                // flush — 파일 단위 미니배치였던 기존 대비 회귀가 아니며, 마지막 파일
+                // 꼬리가 스트림 종료까지 미임베딩으로 남는 것을 막는다.
+                if !chunk_buffer.is_empty() {
+                    process_embed_batch(
+                        std::mem::take(&mut chunk_buffer),
+                        &conn,
+                        embedder,
+                        vector_index,
+                        status,
+                        intensity,
+                        &mut st,
+                    );
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // 스트림 끝 — 남은 부분 배치를 임베딩하고 종료 (취소 시에는 폐기)
+                if !cancel_flag.load(Ordering::Acquire) && !chunk_buffer.is_empty() {
+                    process_embed_batch(
+                        std::mem::take(&mut chunk_buffer),
+                        &conn,
+                        embedder,
+                        vector_index,
+                        status,
+                        intensity,
+                        &mut st,
+                    );
+                }
+                break;
+            }
+        }
+    }
+    let EmbedState {
+        processed,
+        mut pending_mark_file_ids,
+        ..
+    } = st;
+
+    // batch_rx를 먼저 drop해야 프리페치 스레드의 batch_tx.send()가
+    // SendError를 반환하여 스레드가 종료될 수 있음 (데드락 방지)
+    drop(batch_rx);
+
+    // 프리페치 스레드 종료 대기
+    let _ = prefetch_handle.join();
+
+    // 최종 flush: 완료/취소 어느 경로로 루프를 빠져나와도 반드시 1회 저장 후
+    // 버퍼에 남은 완료 파일을 일괄 마킹한다 (이 함수의 에러 반환 경로는 모두
+    // 루프 진입 전이므로 루프 종료 시 이 지점은 항상 실행됨).
+    // 이 저장이 누락되면 이번 세션 임베딩이 재시작 때 유실되어 재계산 비용이 발생한다.
+    flush_save_and_mark(&conn, vector_index, &mut pending_mark_file_ids);
+
+    // 최종 저장 + mmap view 모드 전환 (RAM 회수)
+    let final_chunk_count = vector_index.chunk_count();
+    match vector_index.switch_to_view() {
+        Ok(()) => {
+            tracing::info!("[VectorWorker] Saved and switched to view mode (mmap) — RAM freed");
+        }
+        Err(e) => {
+            // switch_to_view 내부에서 save()를 먼저 호출하므로,
+            // 실패해도 데이터는 이미 저장된 상태
+            tracing::warn!("[VectorWorker] switch_to_view failed (data saved): {}", e);
+        }
+    }
+
+    tracing::info!(
+        "[VectorWorker] Completed. {} chunks embedded this session, {} total in index, cancelled={}",
+        processed,
+        final_chunk_count,
+        was_cancelled
+    );
+
+    // 상태 업데이트 — 취소/실패 여부를 정확히 반영.
+    // 이전 코드는 취소로 빠져나와도 pending=0, is_complete=true 를 보내 사용자에게
+    // "완료됨"으로 보였다. 이제는 실제로 남은 pending 수를 다시 집계한다.
+    let final_pending = match db::retry_on_busy(|| db::get_vector_indexing_stats(&conn)) {
+        Ok(s) => s.pending_chunks,
+        Err(_) => 0,
+    };
+    let fully_done = !was_cancelled && final_pending == 0;
+
+    if let Ok(mut s) = status.write() {
+        s.processed_chunks = base_processed + processed;
+        s.current_file = None;
+        s.pending_chunks = final_pending;
+    }
+
+    send_progress(processed, None, fully_done, true);
+
+    Ok(())
+}
+
+/// 인덱스 저장 + 완료 파일 일괄 마킹 (Crash consistency: save THEN mark)
+///
+/// save() 성공 시에만 버퍼의 file_id 들을 vector_indexed 로 마킹한다.
+/// save() 실패 시 버퍼를 유지한다 — 해당 파일들은 pending으로 남아
+/// 다음 flush 또는 재시작 시 재처리되며, 이미 인덱스에 들어간 청크는
+/// contains_chunk 스킵으로 재임베딩을 피한다.
+fn flush_save_and_mark(
+    conn: &rusqlite::Connection,
+    vector_index: &VectorIndex,
+    pending_mark_file_ids: &mut Vec<i64>,
+) {
+    if let Err(e) = vector_index.save() {
+        tracing::warn!("[VectorWorker] Failed to save index: {}", e);
+        return;
+    }
+    for file_id in pending_mark_file_ids.drain(..) {
+        if let Err(e) = db::retry_on_busy(|| db::mark_file_vector_indexed(conn, file_id)) {
+            tracing::warn!("[VectorWorker] Failed to mark file {}: {}", file_id, e);
+        }
+    }
+}
+
+/// 임베딩 루프의 가변 상태 묶음 — 메인 루프와 `process_embed_batch` 가 공유 (T2-4)
+struct EmbedState {
+    base_processed: usize,
+    total_chunks: usize,
+    processed: usize,
+    last_save: usize,
+    last_save_time: Instant,
+    /// 완료 파일 마킹 버퍼: 파일 1개 완료마다 인덱스 전체를 save()하면
+    /// 파일 수 N에 대해 O(N²) 디스크 쓰기가 되므로, 완료 file_id를 모았다가
+    /// 주기적 flush(save 성공 직후 일괄 마킹)로 처리한다.
+    pending_mark_file_ids: Vec<i64>,
+    tracker: CompletionTracker,
+}
+
+/// 파일 경계를 넘는 청크 스트림 배칭의 파일 완료 추적 (T2-4)
+///
+/// 임베딩 배치가 여러 파일의 청크를 섞어 담으므로, "파일의 모든 청크가 처리됐다"
+/// 는 판정을 청크 단위 집계로 분리한다. 완료 = 성공(스킵 포함)+실패 합이 총청크
+/// 수 도달. 실패가 하나라도 있으면 마킹 대상이 아니라 pending 유지(재시도) 대상.
+/// 맵에는 진행 중(in-flight) 파일만 남으므로 크기는 채널 버퍼 수준으로 작다.
+#[derive(Default)]
+struct CompletionTracker {
+    files: std::collections::HashMap<i64, FileProgress>,
+}
+
+struct FileProgress {
+    path: String,
+    total: usize,
+    ok: usize,
+    failed: usize,
+}
+
+/// 완료 판정된 파일의 처분 정보
+struct CompletedFile {
+    file_id: i64,
+    path: String,
+    /// 전 청크가 인덱스에 존재 (스킵+임베딩 성공, 실패 0) → 마킹 가능
+    fully_ok: bool,
+    failed: usize,
+}
+
+impl CompletionTracker {
+    fn add_file(&mut self, file_id: i64, path: String, total: usize) {
+        self.files.insert(
+            file_id,
+            FileProgress {
+                path,
+                total,
+                ok: 0,
+                failed: 0,
+            },
+        );
+    }
+
+    /// 청크 처리 결과(성공 ok개·실패 failed개)를 기록하고, 파일의 전 청크가
+    /// 집계되면 완료 정보를 반환하며 추적에서 제거한다.
+    fn record(&mut self, file_id: i64, ok: usize, failed: usize) -> Option<CompletedFile> {
+        let fp = self.files.get_mut(&file_id)?;
+        fp.ok += ok;
+        fp.failed += failed;
+        if fp.ok + fp.failed >= fp.total {
+            let fp = self.files.remove(&file_id)?;
+            Some(CompletedFile {
+                file_id,
+                fully_ok: fp.failed == 0,
+                failed: fp.failed,
+                path: fp.path,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// 완료 파일 처분: 전 청크 성공이면 마킹 버퍼로, 실패 포함이면 pending 유지 경고
+fn route_completion(done: CompletedFile, pending_mark_file_ids: &mut Vec<i64>) {
+    if done.fully_ok {
+        pending_mark_file_ids.push(done.file_id);
+    } else {
+        tracing::warn!(
+            "[VectorWorker] File '{}' has {} failed chunks, keeping pending for retry",
+            done.path,
+            done.failed
+        );
+    }
+}
+
+/// 청크 배치 1개 처리: 임베딩 → 인덱스 추가 → 파일 완료 집계 → 상태·주기 저장 (T2-4)
+fn process_embed_batch(
+    batch: Vec<(i64, PendingChunk)>,
+    conn: &rusqlite::Connection,
+    embedder: &Embedder,
+    vector_index: &VectorIndex,
+    status: &Arc<RwLock<VectorIndexingStatus>>,
+    intensity: &IndexingIntensity,
+    st: &mut EmbedState,
+) {
+    let batch_len = batch.len();
+    let (metas, contents): (Vec<(i64, i64)>, Vec<String>) = batch
+        .into_iter()
+        .map(|(file_id, c)| ((file_id, c.chunk_id), c.content))
+        .unzip();
+
+    // 파일별 (성공, 실패) 집계 후 일괄 record — 배치 안에 같은 파일 청크가 여럿이다
+    let mut per_file: std::collections::HashMap<i64, (usize, usize)> =
+        std::collections::HashMap::new();
+    let mut batch_succeeded = 0usize;
+
+    match embedder.embed_batch(&contents) {
+        Ok(embeddings) => {
+            for ((file_id, chunk_id), embedding) in metas.iter().zip(embeddings.iter()) {
+                match vector_index.add(*chunk_id, embedding) {
+                    Ok(()) => {
+                        per_file.entry(*file_id).or_default().0 += 1;
+                        batch_succeeded += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!("[VectorWorker] Failed to add vector {}: {}", chunk_id, e);
+                        per_file.entry(*file_id).or_default().1 += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // 배치 전체 실패 → 전 청크 실패 집계 (processed 미반영, 파일은 pending 유지)
+            tracing::warn!(
+                "[VectorWorker] Embedding failed ({} chunks): {}",
+                batch_len,
+                e
+            );
+            for (file_id, _) in &metas {
+                per_file.entry(*file_id).or_default().1 += 1;
+            }
+        }
+    }
+
+    for (file_id, (ok, failed)) in per_file {
+        if let Some(done) = st.tracker.record(file_id, ok, failed) {
+            route_completion(done, &mut st.pending_mark_file_ids);
+        }
+    }
+
+    // 진행률은 **실제로 벡터 인덱스에 추가된 청크** 만 집계한다.
+    // 실패한 청크까지 더하면 "완료 100%"로 보이는데도 재시도 대상이 남는다.
+    st.processed += batch_succeeded;
+
+    // Embedder Mutex 양보: 검색 스레드가 끼어들 수 있도록
+    std::thread::yield_now();
+
+    // 인덱싱 강도에 따른 쓰로틀링
+    match intensity {
+        IndexingIntensity::Fast => {} // sleep 없음
+        IndexingIntensity::Balanced => std::thread::sleep(Duration::from_millis(200)),
+        IndexingIntensity::Background => std::thread::sleep(Duration::from_millis(500)),
+    }
+
+    // 상태 업데이트 (누적)
+    if let Ok(mut s) = status.write() {
+        s.processed_chunks = st.base_processed + st.processed;
+        s.pending_chunks = st
+            .total_chunks
+            .saturating_sub(st.base_processed + st.processed);
+    }
+
+    // 주기적 저장 + 완료 파일 일괄 마킹.
+    // 저장 간격을 인덱스 크기에 비례해 넓힌다: save()는 인덱스 전체를
+    // 재기록하므로 고정 1000청크마다 저장하면 대량 빌드에서 누적 쓰기가
+    // O(N²/1000)로 커진다. max(1000, size/20)으로 ~O(20·N)까지 억제
+    // (시간 기준 SAVE_INTERVAL_SECS가 백스톱이라 간격이 넓어도 안전).
+    let save_interval = SAVE_INTERVAL.max(vector_index.chunk_count() / 20);
+    if st.processed - st.last_save >= save_interval {
+        flush_save_and_mark(conn, vector_index, &mut st.pending_mark_file_ids);
+        st.last_save = st.processed;
+        st.last_save_time = Instant::now();
+    }
+}
+
+/// 프리페치 스레드: DB에서 청크를 미리 로드하여 채널로 전송
+fn run_prefetch_thread(
+    db_path: PathBuf,
+    batch_tx: crossbeam_channel::Sender<PrefetchedBatch>,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    let conn = match db::get_connection(&db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("[Prefetch] DB connection failed: {}", e);
+            return;
+        }
+    };
+
+    // 대기 중인 파일 ID 목록 (SQLITE_BUSY 재시도: 인덱싱/감시와 충돌 시 생존)
+    let pending_file_ids = match db::retry_on_busy(|| db::get_pending_vector_file_ids(&conn)) {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("[Prefetch] Failed to get pending files: {}", e);
+            return;
+        }
+    };
+
+    for file_id in pending_file_ids {
+        // 취소 확인
+        if cancel_flag.load(Ordering::Acquire) {
+            tracing::debug!("[Prefetch] Cancelled");
+            break;
+        }
+
+        // 해당 파일의 전체 청크 로드 (LIMIT 없음 - 부분 처리 방지, busy 재시도)
+        let file_chunks =
+            match db::retry_on_busy(|| db::get_pending_vector_chunks_for_file(&conn, file_id)) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        "[Prefetch] Failed to get chunks for file {}: {}",
+                        file_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+        if file_chunks.is_empty() {
+            continue;
+        }
+
+        let file_path = file_chunks
+            .first()
+            .map(|c| c.file_path.clone())
+            .unwrap_or_default();
+
+        // 배치 전송
+        let batch = PrefetchedBatch {
+            file_id,
+            file_path,
+            chunks: file_chunks,
+        };
+
+        if batch_tx.send(batch).is_err() {
+            // 수신자가 종료됨
+            tracing::debug!("[Prefetch] Receiver dropped, stopping");
+            break;
+        }
+    }
+
+    tracing::debug!("[Prefetch] Thread completed");
+}
+
+/// Windows 스레드 우선순위 설정
+#[cfg(target_os = "windows")]
+fn set_thread_priority(intensity: &IndexingIntensity) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_IDLE,
+        THREAD_PRIORITY_NORMAL,
+    };
+
+    let priority = match intensity {
+        IndexingIntensity::Fast => THREAD_PRIORITY_NORMAL,
+        IndexingIntensity::Balanced => THREAD_PRIORITY_BELOW_NORMAL,
+        IndexingIntensity::Background => THREAD_PRIORITY_IDLE,
+    };
+
+    unsafe {
+        let handle = GetCurrentThread();
+        if SetThreadPriority(handle, priority) == 0 {
+            tracing::warn!("[VectorWorker] Failed to set thread priority");
+        } else {
+            tracing::info!("[VectorWorker] Thread priority set to {:?}", intensity);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 파일 청크가 여러 배치에 걸쳐 처리되어도 완료 시점이 정확해야 한다 (T2-4)
+    #[test]
+    fn tracker_completes_file_across_batches() {
+        let mut t = CompletionTracker::default();
+        t.add_file(1, "a.hwpx".into(), 5);
+        assert!(t.record(1, 2, 0).is_none(), "스킵 2/5 — 미완료");
+        assert!(t.record(1, 2, 0).is_none(), "성공 4/5 — 미완료");
+        let done = t.record(1, 1, 0).expect("5/5 — 완료");
+        assert!(done.fully_ok);
+        assert_eq!(done.file_id, 1);
+        // 완료 후 추적 제거 — 재기록은 no-op
+        assert!(t.record(1, 1, 0).is_none());
+    }
+
+    /// 실패 청크가 있으면 완료돼도 fully_ok=false (마킹 금지, pending 유지)
+    #[test]
+    fn tracker_failed_chunk_blocks_marking() {
+        let mut t = CompletionTracker::default();
+        t.add_file(7, "b.docx".into(), 3);
+        assert!(t.record(7, 2, 0).is_none());
+        let done = t.record(7, 0, 1).expect("3/3 집계 — 완료");
+        assert!(!done.fully_ok);
+        assert_eq!(done.failed, 1);
+    }
+
+    /// 배치가 파일 경계를 넘어 두 파일 청크를 섞어도 각자 정확히 완료된다
+    #[test]
+    fn tracker_interleaved_files() {
+        let mut t = CompletionTracker::default();
+        t.add_file(1, "a".into(), 2);
+        t.add_file(2, "b".into(), 2);
+        assert!(t.record(1, 1, 0).is_none());
+        assert!(t.record(2, 1, 0).is_none());
+        assert!(t.record(2, 1, 0).expect("b 완료").fully_ok);
+        assert!(t.record(1, 1, 0).expect("a 완료").fully_ok);
+    }
+
+    /// route_completion: 성공 파일만 마킹 버퍼에 쌓인다
+    #[test]
+    fn route_completion_buffers_only_fully_ok() {
+        let mut buf: Vec<i64> = Vec::new();
+        route_completion(
+            CompletedFile {
+                file_id: 10,
+                path: "ok".into(),
+                fully_ok: true,
+                failed: 0,
+            },
+            &mut buf,
+        );
+        route_completion(
+            CompletedFile {
+                file_id: 11,
+                path: "bad".into(),
+                fully_ok: false,
+                failed: 2,
+            },
+            &mut buf,
+        );
+        assert_eq!(buf, vec![10]);
+    }
+}

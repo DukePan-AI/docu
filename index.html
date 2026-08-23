@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Anything - 로컬 문서 검색</title>
+    <!-- Pretendard 폰트 (로컬 번들) -->
+    <link rel="stylesheet" href="/src/assets/fonts/pretendard.css" />
+  </head>
+  <body>
+    <script src="/theme-init.js"></script>
+    <style>
+      html { background: #FAFAF7; }
+      html.dark { background: #111113; }
+      .splash { display:flex; align-items:center; justify-content:center; height:100vh; }
+      .splash-spinner { width:28px; height:28px; border:2.5px solid #E7E5E0; border-top-color:#01AF7A; border-radius:50%; animation:spin .6s linear infinite; }
+      html.dark .splash-spinner { border-color:#2A2A2D; border-top-color:#10C48E; }
+      @keyframes spin { to { transform:rotate(360deg); } }
+    </style>
+    <div id="root"><div class="splash"><div class="splash-spinner"></div></div></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,470 @@
+use rusqlite::{params, Connection, Result};
+use std::path::Path;
+
+use super::pool::get_connection;
+
+// ==================== 스키마 마이그레이션 ====================
+
+/// 현재 스키마 버전
+const CURRENT_SCHEMA_VERSION: i32 = 18;
+
+/// 스키마 버전 조회
+fn get_schema_version(conn: &Connection) -> i32 {
+    conn.query_row(
+        "SELECT version FROM schema_version WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// 스키마 버전 저장
+fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?1)",
+        params![version],
+    )?;
+    Ok(())
+}
+
+/// 데이터베이스 초기화
+pub fn init_database(db_path: &Path) -> Result<()> {
+    let conn = get_connection(db_path)?;
+
+    // auto_vacuum은 테이블 생성 전에만 설정 가능 (새 DB에서만 효과)
+    // 기존 DB에서는 무시되므로 항상 호출해도 안전
+    conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+
+    migrate_schema(&conn, db_path)
+}
+
+/// 기존 Connection으로 스키마 마이그레이션 (clear_all_data에서도 사용)
+pub fn migrate_schema(conn: &Connection, db_path: &Path) -> Result<()> {
+    // 스키마 버전 테이블 (항상 먼저 생성)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            id INTEGER PRIMARY KEY,
+            version INTEGER NOT NULL
+        )",
+        [],
+    )?;
+
+    let current_version = get_schema_version(conn);
+
+    // === v1: 기본 테이블 ===
+    if current_version < 1 {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                size INTEGER,
+                modified_at INTEGER,
+                hash TEXT,
+                indexed_at INTEGER
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+                chunk_index INTEGER,
+                start_offset INTEGER,
+                end_offset INTEGER,
+                page_number INTEGER,
+                paragraph_number INTEGER,
+                location_hint TEXT
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                content,
+                content_rowid='id',
+                tokenize='unicode61'
+            )",
+            [],
+        )?;
+
+        // NOTE: 과거 v1은 files_fts 가상 테이블과 idx_files_path 인덱스도 생성했으나
+        // v15/v16에서 제거됨 (files_fts는 어떤 검색도 사용 안 함, idx_files_path는
+        // path UNIQUE 암묵 인덱스와 중복). 신규 DB에서는 처음부터 생성하지 않는다.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS watched_folders (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                added_at INTEGER,
+                is_favorite INTEGER DEFAULT 0
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)",
+            [],
+        )?;
+
+        set_schema_version(conn, 1)?;
+        tracing::info!("Schema migrated to v1 (base tables)");
+    }
+
+    // === v2: is_favorite 컬럼 ===
+    if current_version < 2 {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE watched_folders ADD COLUMN is_favorite INTEGER DEFAULT 0",
+            [],
+        ) {
+            tracing::trace!("Migration v2: is_favorite already exists: {}", e);
+        }
+        set_schema_version(conn, 2)?;
+        tracing::info!("Schema migrated to v2 (is_favorite)");
+    }
+
+    // === v3: indexing_status 컬럼 ===
+    if current_version < 3 {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE watched_folders ADD COLUMN indexing_status TEXT DEFAULT 'completed'",
+            [],
+        ) {
+            tracing::trace!("Migration v3: indexing_status already exists: {}", e);
+        }
+        set_schema_version(conn, 3)?;
+        tracing::info!("Schema migrated to v3 (indexing_status)");
+    }
+
+    // === v4: 2단계 인덱싱 (fts_indexed_at, vector_indexed_at) ===
+    if current_version < 4 {
+        if let Err(e) = conn.execute("ALTER TABLE files ADD COLUMN fts_indexed_at INTEGER", []) {
+            tracing::trace!("Migration v4: fts_indexed_at already exists: {}", e);
+        }
+        if let Err(e) = conn.execute("ALTER TABLE files ADD COLUMN vector_indexed_at INTEGER", []) {
+            tracing::trace!("Migration v4: vector_indexed_at already exists: {}", e);
+        }
+        // 기존 데이터 마이그레이션
+        let _ = conn.execute(
+            "UPDATE files SET fts_indexed_at = indexed_at WHERE fts_indexed_at IS NULL AND indexed_at IS NOT NULL",
+            [],
+        );
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_fts_indexed ON files(fts_indexed_at)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_vector_indexed ON files(vector_indexed_at)",
+            [],
+        )?;
+
+        set_schema_version(conn, 4)?;
+        tracing::info!("Schema migrated to v4 (two-phase indexing)");
+    }
+
+    // === v5: page_end 컬럼 ===
+    if current_version < 5 {
+        if let Err(e) = conn.execute("ALTER TABLE chunks ADD COLUMN page_end INTEGER", []) {
+            tracing::trace!("Migration v5: page_end already exists: {}", e);
+        }
+        set_schema_version(conn, 5)?;
+        tracing::info!("Schema migrated to v5 (page_end)");
+    }
+
+    // === v6: last_synced_at 컬럼 (시작 sync 스킵용) ===
+    if current_version < 6 {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE watched_folders ADD COLUMN last_synced_at INTEGER",
+            [],
+        ) {
+            tracing::trace!("Migration v6: last_synced_at already exists: {}", e);
+        }
+        set_schema_version(conn, 6)?;
+        tracing::info!("Schema migrated to v6 (last_synced_at)");
+    }
+
+    // === v7: 북마크 테이블 ===
+    if current_version < 7 {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                content_preview TEXT NOT NULL DEFAULT '',
+                page_number INTEGER,
+                location_hint TEXT,
+                note TEXT,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bookmarks_file_path ON bookmarks(file_path)",
+            [],
+        )?;
+        set_schema_version(conn, 7)?;
+        tracing::info!("Schema migrated to v7 (bookmarks)");
+    }
+
+    // === v8: 검색어 자동완성 (fts5vocab + search_queries) ===
+    if current_version < 8 {
+        // fts5vocab: 인덱싱된 용어 빈도 조회용 가상 테이블
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, 'row')",
+            [],
+        )?;
+
+        // 검색어 히스토리 (빈도 추적)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS search_queries (
+                id INTEGER PRIMARY KEY,
+                query TEXT UNIQUE NOT NULL,
+                frequency INTEGER NOT NULL DEFAULT 1,
+                last_searched_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_search_queries_freq ON search_queries(frequency DESC)",
+            [],
+        )?;
+
+        set_schema_version(conn, 8)?;
+        tracing::info!("Schema migrated to v8 (autocomplete: fts5vocab + search_queries)");
+    }
+
+    // === v9: 북마크 중복 방지 (file_path UNIQUE) ===
+    if current_version < 9 {
+        // 기존 중복 북마크 정리 (가장 최근 것만 유지)
+        conn.execute(
+            "DELETE FROM bookmarks WHERE id NOT IN (
+                SELECT MAX(id) FROM bookmarks GROUP BY file_path
+            )",
+            [],
+        )?;
+        // 기존 일반 인덱스 제거 후 UNIQUE 인덱스 생성
+        conn.execute("DROP INDEX IF EXISTS idx_bookmarks_file_path", [])?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bookmarks_file_path ON bookmarks(file_path)",
+            [],
+        )?;
+        set_schema_version(conn, 9)?;
+        tracing::info!("Schema migrated to v9 (bookmark unique constraint)");
+    }
+
+    // v10: 파일 태그 시스템
+    if get_schema_version(conn) < 10 {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS file_tags (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_file_tags_path_tag ON file_tags(file_path, tag)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag)",
+            [],
+        )?;
+        set_schema_version(conn, 10)?;
+        tracing::info!("Schema migrated to v10 (file tags)");
+    }
+
+    // === v11: chunks 테이블에 원본 content 컬럼 추가 ===
+    // FTS 테이블에는 형태소 토큰이 추가된 텍스트가 저장되므로
+    // 미리보기용 원본 텍스트를 별도 보관
+    if get_schema_version(conn) < 11 {
+        if let Err(e) = conn.execute("ALTER TABLE chunks ADD COLUMN content TEXT", []) {
+            tracing::trace!("Migration v11: content column already exists: {}", e);
+        }
+        set_schema_version(conn, 11)?;
+        tracing::info!("Schema migrated to v11 (chunks.content for preview)");
+    }
+
+    // === v12: Document Lineage Graph ===
+    // 같은 논리 문서의 여러 버전 파일(계약서_최종, 계약서_최최종, ...)을
+    // 하나의 lineage_id로 묶어 검색 결과에서 중복 노이즈를 제거한다.
+    //   lineage_id:     그룹 UUID (같은 lineage끼리 공유)
+    //   parent_file_id: 추정된 이전 버전 파일 id (계보 체인용)
+    //   lineage_role:   'canonical' | 'version'
+    //   version_label:  UI 표시용 라벨 ("최최종", "v3", "수정본")
+    //   stem_norm:      파일명 정규화 결과 (1차 그루핑 키, 인덱스)
+    if get_schema_version(conn) < 12 {
+        for stmt in [
+            "ALTER TABLE files ADD COLUMN lineage_id TEXT",
+            "ALTER TABLE files ADD COLUMN parent_file_id INTEGER",
+            "ALTER TABLE files ADD COLUMN lineage_role TEXT",
+            "ALTER TABLE files ADD COLUMN version_label TEXT",
+            "ALTER TABLE files ADD COLUMN stem_norm TEXT",
+        ] {
+            if let Err(e) = conn.execute(stmt, []) {
+                tracing::trace!("Migration v12: column already exists: {}", e);
+            }
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_lineage ON files(lineage_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_stem_norm ON files(stem_norm)",
+            [],
+        )?;
+        set_schema_version(conn, 12)?;
+        tracing::info!("Schema migrated to v12 (document lineage graph)");
+    }
+
+    // === v13: Behavioral Canonical ===
+    // 사용자가 실제로 여는 파일을 추적해 "진짜 최신본"을 학습한다.
+    //   open_count:     사용자가 이 파일을 연 총 횟수
+    //   last_opened_at: 마지막으로 연 시각 (Unix seconds)
+    // 두 지표는 canonical_score에 반영되어 파일명 라벨을 보정한다.
+    if get_schema_version(conn) < 13 {
+        for stmt in [
+            "ALTER TABLE files ADD COLUMN open_count INTEGER DEFAULT 0",
+            "ALTER TABLE files ADD COLUMN last_opened_at INTEGER",
+        ] {
+            if let Err(e) = conn.execute(stmt, []) {
+                tracing::trace!("Migration v13: column already exists: {}", e);
+            }
+        }
+        set_schema_version(conn, 13)?;
+        tracing::info!("Schema migrated to v13 (behavioral canonical)");
+    }
+
+    // === v14: 벡터 임베딩 재색인 트리거 ===
+    // v2.3.8 이하에서는 벡터 워커가 `fts.content`(원문 + 형태소 토큰) 를 읽어
+    // 임베딩을 생성했다. 그 결과 시맨틱 공간이 검색용 보강 토큰으로 오염돼
+    // 하이브리드/RAG 품질이 구조적으로 저하된 상태였다.
+    //
+    // v2.3.9 에서 워커가 `c.content`(원문) 를 읽도록 수정되었으므로,
+    // 기존 벡터는 원문이 아닌 오염된 임베딩이기 때문에 **전면 재색인**이 필요하다.
+    //
+    //   1) 모든 파일의 `vector_indexed_at = NULL` 로 리셋 → 다음 부팅 때 재임베딩
+    //   2) 기존 `vectors.usearch` 파일 삭제 → 디스크의 오염된 벡터 회수
+    if get_schema_version(conn) < 14 {
+        let reset = conn.execute("UPDATE files SET vector_indexed_at = NULL", [])?;
+        tracing::info!(
+            "Migration v14: reset vector_indexed_at on {} files (will re-embed)",
+            reset
+        );
+
+        // vector index 는 `vectors.usearch` 본체 + `vectors.map`(chunk_id ↔ key 매핑)
+        // 두 파일이 짝으로 존재해야 정합. `Path::with_extension("map")` 은 기존
+        // `.usearch` 를 **교체**하므로 실제 파일명은 `vectors.map` 이다.
+        // (과거 주석이 `vectors.usearch.map` 으로 잘못 표기돼 있었으나 그런 파일은 만들어진
+        // 적이 없다 — v2.3.9 migration 이 실제 `.map` 을 못 지워 다음 부팅에 구포맷
+        // mmap 으로 usearch FFI 가 segfault 를 낼 수 있던 원인.)
+        //
+        // 본체만 지우고 `.map` 만 남으면 usearch FFI 가 부분 기록된 mmap 위에서
+        // segfault 를 낼 수 있어 **두 본체 파일과 save 중간산출물(.tmp) 까지 함께** 회수한다.
+        // `.usearch.lock` 은 usearch 런타임이 만들 수 있는 파일로 보수적으로 같이 제거.
+        //
+        // 또한 잠금/AV 등으로 삭제가 실패하면 schema_version 을 전진시키지 않고
+        // 다음 부팅에 재시도한다 — 반쯤 적용된 채 schema_version 만 올라가면
+        // 디스크엔 구포맷 벡터가 남고 DB 는 NULL 인 영구 불일치 상태가 된다.
+        let mut all_removed = true;
+        if let Some(dir) = db_path.parent() {
+            for name in [
+                "vectors.usearch",
+                "vectors.map",
+                "vectors.usearch.tmp",
+                "vectors.map.tmp",
+                "vectors.usearch.lock",
+            ] {
+                let p = dir.join(name);
+                if p.exists() {
+                    match std::fs::remove_file(&p) {
+                        Ok(_) => tracing::info!("Migration v14: removed {:?}", p),
+                        Err(e) => {
+                            tracing::warn!("Migration v14: cannot remove {:?}: {}", p, e);
+                            all_removed = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if all_removed {
+            set_schema_version(conn, 14)?;
+            tracing::info!("Schema migrated to v14 (vector re-embedding trigger)");
+        } else {
+            tracing::warn!(
+                "Migration v14: 일부 벡터 인덱스 파일을 회수하지 못해 schema_version 전진을 보류합니다 (다음 재시작 시 재시도)"
+            );
+        }
+    }
+
+    // === v15: files.modified_at 인덱스 + 중복 idx_files_path 제거 ===
+    // browse_recent_files / get_recent_files / LIKE 폴백이 `ORDER BY modified_at DESC`에
+    // 의존하지만 인덱스가 없어 풀스캔+정렬이 발생했다.
+    // idx_files_path는 path UNIQUE 제약의 암묵 인덱스와 완전 중복 — 쓰기 오버헤드만 유발.
+    //
+    // ⚠️ v14는 실패 시 schema_version을 전진시키지 않고 다음 부팅에 재시도하므로,
+    //    `== 14` 게이트로 v14 완료 전에는 실행하지 않는다 (버전 leapfrog 방지).
+    if get_schema_version(conn) == 14 {
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified_at DESC)",
+            [],
+        )?;
+        conn.execute("DROP INDEX IF EXISTS idx_files_path", [])?;
+        set_schema_version(conn, 15)?;
+        tracing::info!("Schema migrated to v15 (files.modified_at index)");
+    }
+
+    // === v16: 미사용 files_fts 제거 ===
+    // 파일명 검색은 인메모리 캐시(filename_cache) 또는 files.name LIKE만 사용하며
+    // files_fts를 SELECT하는 코드는 없다 (unicode61은 한글 부분문자열 매칭 불가).
+    // 모든 upsert마다 DELETE+INSERT 2쿼리 유지 비용과 DB 용량만 차지해 제거.
+    if get_schema_version(conn) == 15 {
+        conn.execute("DROP TABLE IF EXISTS files_fts", [])?;
+        set_schema_version(conn, 16)?;
+        tracing::info!("Schema migrated to v16 (drop unused files_fts)");
+    }
+
+    // === v17: 홈 통계 질의 인덱스 (last_opened_at / size) — T3-4 ===
+    // get_recently_opened_files / get_largest_files 가 `WHERE … IS NOT NULL
+    // ORDER BY … DESC LIMIT N` 인데 인덱스가 없어 파일 수만큼 풀스캔+정렬했다.
+    // 질의 술어와 동일한 부분 인덱스로 스캔을 LIMIT N 워크로 줄인다
+    // (last_opened_at 은 사용자가 연 파일에만 기록되므로 부분 인덱스가 특히 작다).
+    if get_schema_version(conn) == 16 {
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_last_opened
+             ON files(last_opened_at DESC) WHERE last_opened_at IS NOT NULL",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_size
+             ON files(size DESC) WHERE size IS NOT NULL",
+            [],
+        )?;
+        set_schema_version(conn, 17)?;
+        tracing::info!("Schema migrated to v17 (last_opened_at/size partial indexes)");
+    }
+
+    // === v18: files.garbled — 복사 시 깨지는 문서(CID/PUA 매핑 손상) 표식 ===
+    // 화면엔 정상이지만 복사하면 글자가 깨지는 문서(PDF CID/ToUnicode 누락, HWP PUA
+    // 커스텀폰트)를 인덱싱 시점에 looks_like_garbage_text 로 판정해 저장한다.
+    // 검색 결과·미리보기의 경고 배지에 사용.
+    if get_schema_version(conn) == 17 {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE files ADD COLUMN garbled INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            tracing::trace!("Migration v18: garbled already exists: {}", e);
+        }
+        set_schema_version(conn, 18)?;
+        tracing::info!("Schema migrated to v18 (files.garbled)");
+    }
+
+    tracing::info!(
+        "Database initialized at {:?} (schema v{})",
+        db_path,
+        CURRENT_SCHEMA_VERSION
+    );
+    Ok(())
+}

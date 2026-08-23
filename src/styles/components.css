@@ -1,0 +1,715 @@
+/* ============================================
+   Component Styles
+   ============================================ */
+
+/* Noise Texture Overlay — 미세한 질감으로 flat 배경에 깊이감 추가 */
+.noise-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0.025;
+  background-image: var(--bg-noise);
+  background-repeat: repeat;
+  background-size: 200px 200px;
+}
+
+.dark .noise-overlay {
+  opacity: 0.04;
+}
+
+/* AI 섹션 슬라이드 인 애니메이션 */
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.ai-section-enter {
+  animation: slideDown 0.2s ease-out;
+}
+
+/* Result Row — 에디토리얼: 카드 테두리 제거, 구분선(아래 result-list-divided)으로 위계.
+   hover 는 박스 lift 대신 옅은 배경 틴트만 (차분). */
+.result-card {
+  background-color: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  box-shadow: none;
+  transition: background-color var(--transition-fast);
+  position: relative;
+}
+
+.result-card:hover {
+  background-color: var(--color-bg-secondary);
+}
+
+/* 프리뷰 패널 - 복사/내보내기 드롭다운 메뉴 아이템 (세로 팝오버) */
+.export-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.375rem 0.75rem;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+.export-dropdown-item:hover {
+  background-color: var(--color-accent-light);
+  color: var(--color-accent);
+}
+
+/* ─── 프리뷰 패널 — v3.0 따뜻한 프리미엄 (result-card 와 동일 언어) ─── */
+/* 본문 영역과 분리되는 좌측 경계 depth — 1px border 단독의 "붙은 평면"감 해소 */
+.preview-panel {
+  box-shadow: -10px 0 30px -22px rgba(28, 25, 23, 0.22);
+}
+.dark .preview-panel {
+  box-shadow: -10px 0 30px -18px rgba(0, 0, 0, 0.55);
+}
+
+/* AI 섹션 — 평면 단색 채움 → soft gradient + 상단 sheen + lift 로 입체화.
+   "AI 기능엔 gradient 허용"(DESIGN.md) 명분을 가장 강하게 받는 표면. */
+.preview-ai-section {
+  background-color: var(--color-accent-light);
+  background-image: var(--gradient-accent-soft);
+}
+
+/* 인라인 참조 링크(법령/외부 URL) — opacity hover(DESIGN.md 금지) 대신 색 전환 */
+.preview-inline-link {
+  transition: color var(--transition-fast);
+}
+.preview-inline-link:hover {
+  color: var(--color-accent-hover) !important;
+}
+
+/* Content max-width container */
+.content-column {
+  max-width: var(--content-max-width);
+  margin-left: auto;
+  margin-right: auto;
+  width: 100%;
+}
+
+/* Result list divider container */
+.result-list-divided > .group + .group {
+  border-top: 1px solid var(--color-border);
+}
+
+/* HTML Table Preview — 검색 결과 펼침 시 표 렌더링 */
+.html-table-preview {
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  overflow-x: auto;
+  margin: 4px 0;
+}
+
+.html-table-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+
+.html-table-preview th,
+.html-table-preview td {
+  border: 1px solid var(--color-border);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.html-table-preview th {
+  background-color: var(--color-bg-tertiary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.html-table-preview tr:hover td {
+  background-color: var(--color-bg-secondary);
+}
+
+/* Search Highlight Marks */
+mark.hl-search,
+mark.hl-refine,
+mark.hl-both,
+mark.hl-filename {
+  border-radius: 3px;
+  padding: 1px 3px;
+  margin: 0 -1px;
+  font-weight: 600;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  transition: background-color 0.15s ease;
+}
+
+mark.hl-search {
+  background-color: var(--color-highlight-bg);
+  color: var(--color-highlight-text);
+  border-bottom: 2px solid var(--color-highlight-border);
+}
+
+mark.hl-refine,
+mark.hl-both {
+  background-color: var(--color-highlight-refine-bg);
+  color: var(--color-highlight-refine-text);
+  border-bottom: 2px solid var(--color-highlight-refine-border);
+}
+
+mark.hl-filename {
+  background-color: var(--color-highlight-filename-bg);
+  color: var(--color-highlight-filename-text);
+  border-bottom: 2px solid var(--color-highlight-filename-border);
+}
+
+/* Preview find-in-page (Ctrl+F) — 검색어 하이라이트(황색 hl-search)와 구분되는 액센트 톤.
+   CSS Custom Highlight API (T3-6): DOM 을 감싸지 않고 Range 에 칠한다.
+   ::highlight 는 background/color/text-decoration 계열만 지원 — 보더 대신 밑줄. */
+::highlight(docufinder-find) {
+  background-color: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  text-decoration: underline 2px var(--color-accent-muted);
+}
+
+::highlight(docufinder-find-active) {
+  background-color: var(--color-accent);
+  color: #fff;
+  text-decoration: underline 2px var(--color-accent-active);
+}
+
+/* Citation chip — AI 답변 본문 인라인 [출처N] 클릭 버튼 */
+.cite-chip {
+  display: inline;
+  font-size: 0.78em;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--color-accent-ai);
+  background-color: var(--color-accent-ai-subtle);
+  border: none;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: 0 1px;
+  cursor: pointer;
+  vertical-align: baseline;
+  transition: background-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+.cite-chip:hover:not(:disabled) {
+  background-color: var(--color-accent-ai);
+  color: #fff;
+}
+.cite-chip:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* Citation jump flash — AI 답변 [출처N] 클릭 시 점프 대상 블록 강조 */
+.cite-flash {
+  animation: cite-flash-pulse 2.2s ease-out;
+  border-radius: 4px;
+}
+@keyframes cite-flash-pulse {
+  0%   { background-color: var(--color-accent-light); box-shadow: 0 0 0 3px var(--color-accent-light); }
+  15%  { background-color: var(--color-accent-light); box-shadow: 0 0 0 3px var(--color-accent-light); }
+  100% { background-color: transparent; box-shadow: 0 0 0 3px transparent; }
+}
+
+/* Snippet separator (preview mode ... → ·) */
+.snippet-sep {
+  color: var(--color-text-muted);
+  font-weight: 400;
+  opacity: 0.6;
+  user-select: none;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-hover);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  transition: background 0.15s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+/* Dark mode scrollbar */
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+/* Results scroll area — 폭 고정, 호버 시 "색상만" 진하게
+   (폭 변경 시 컨텐츠 reflow 로 화면 흔들림 발생 → 폭은 항상 동일하게 유지) */
+.results-scroll::-webkit-scrollbar {
+  width: 10px;
+}
+.results-scroll::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  background-clip: content-box;
+  transition: background-color 0.15s;
+}
+.results-scroll:hover::-webkit-scrollbar-thumb,
+.results-scroll:focus-within::-webkit-scrollbar-thumb {
+  background: var(--color-text-muted);
+  background-clip: content-box;
+}
+.dark .results-scroll:hover::-webkit-scrollbar-thumb,
+.dark .results-scroll:focus-within::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.35);
+  background-clip: content-box;
+}
+
+/* 스크롤바 공간을 항상 예약 — 스크롤 없어도 컨텐츠 폭 동일 유지 (흔들림 방지) */
+.results-scroll {
+  scrollbar-gutter: stable;
+}
+
+/* Lucide 아이콘 기본 stroke-width: 2 → 1.5 (더 세련된 미학) */
+.lucide {
+  stroke-width: 1.5 !important;
+}
+
+/* Heading tracking — 큰 텍스트일수록 자간을 조임 */
+.ts-hero, .ts-2xl, .ts-xl {
+  letter-spacing: var(--tracking-hero);
+}
+.ts-lg {
+  letter-spacing: -0.02em;
+}
+
+.text-body-tracking {
+  letter-spacing: var(--tracking-body);
+}
+
+/* Typography Helpers */
+.text-display {
+  font-family: var(--font-display);
+}
+
+.text-mono {
+  font-family: var(--font-mono);
+}
+
+/* Type Scale Classes */
+.ts-2xs { font-size: var(--text-2xs); }
+.ts-xs  { font-size: var(--text-xs); }
+.ts-sm  { font-size: var(--text-sm); }
+.ts-base { font-size: var(--text-base); }
+.ts-md  { font-size: var(--text-md); }
+.ts-lg  { font-size: var(--text-lg); }
+.ts-xl  { font-size: var(--text-xl); }
+.ts-2xl { font-size: var(--text-2xl); }
+.ts-hero { font-size: var(--text-hero); }
+
+/* Result Card — 좌측 컬러 스트라이프 제거(DESIGN.md "no left-border accents").
+   파일타입은 우측 배지로 표현. hover 시에만 옅은 파일타입 배경 틴트로 스캔성 보조. */
+.result-stripe-hwpx:hover { background-color: var(--color-file-hwpx-bg); }
+.result-stripe-docx:hover { background-color: var(--color-file-docx-bg); }
+.result-stripe-xlsx:hover { background-color: var(--color-file-xlsx-bg); }
+.result-stripe-pdf:hover  { background-color: var(--color-file-pdf-bg); }
+.result-stripe-txt:hover  { background-color: var(--color-file-txt-bg); }
+.result-stripe-hwp:hover  { background-color: var(--color-file-hwpx-bg); }
+.result-stripe-pptx:hover { background-color: var(--color-file-pptx-bg); }
+
+/* Interactive Elements */
+.btn-primary {
+  background: var(--color-accent);
+  color: white;
+  box-shadow: 0 1px 2px rgba(28, 25, 23, 0.12);
+  transition: all var(--transition-fast);
+}
+
+.btn-primary:hover {
+  background: var(--color-accent-hover);
+  box-shadow: 0 2px 8px rgba(1, 175, 122, 0.2);
+}
+
+.btn-primary:active {
+  transform: scale(0.98);
+}
+
+.input-modern {
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-inner);
+  transition: all 0.2s var(--ease-out-expo);
+}
+
+.input-modern:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(1, 175, 122, 0.08);
+  background: var(--color-bg-secondary);
+}
+
+/* 컨텍스트 메뉴 아이템 */
+.ctx-menu-item {
+  color: var(--color-text-primary);
+  background-color: transparent;
+  transition: background-color 0.15s, color 0.15s;
+}
+.ctx-menu-item:hover {
+  background-color: var(--color-accent-light);
+  color: var(--color-accent);
+}
+
+/* 컨텍스트 메뉴 위험 액션 (삭제/제거) */
+.ctx-menu-item-danger {
+  color: var(--color-error);
+  background-color: transparent;
+  transition: background-color 0.15s, color 0.15s;
+}
+.ctx-menu-item-danger:hover {
+  background-color: var(--color-error-bg);
+  color: var(--color-error);
+}
+
+/* 즐겨찾기 토글 메뉴 아이템 */
+.ctx-menu-item-favorite {
+  color: var(--color-text-primary);
+  background-color: transparent;
+  transition: background-color 0.15s, color 0.15s;
+}
+.ctx-menu-item-favorite--active {
+  color: var(--color-favorite);
+}
+.ctx-menu-item-favorite:hover {
+  background-color: var(--color-favorite-bg);
+  color: var(--color-favorite);
+}
+
+/* ─── 문서 미리보기 (doc-preview) ─── */
+
+.doc-preview {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.8;
+  color: var(--color-text-secondary);
+  word-break: break-word;
+}
+
+/* 헤딩 — 크기 차이 최소화, 주로 font-weight + 색상 + 여백 + 구분선으로 위계 표현 */
+.doc-h1 {
+  font-size: 1.3em;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin: 1.1em 0 0.4em;
+  padding-bottom: 0.2em;
+  border-bottom: 1.5px solid var(--color-border);
+  line-height: 1.4;
+}
+.doc-h2 {
+  font-size: 1.15em;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin: 0.9em 0 0.35em;
+  padding-bottom: 0.12em;
+  border-bottom: 1px solid var(--color-border-subtle);
+  line-height: 1.4;
+}
+.doc-h3 {
+  font-size: 1.05em;
+  font-weight: 650;
+  color: var(--color-text-primary);
+  margin: 0.8em 0 0.25em;
+  line-height: 1.4;
+}
+.doc-h4 {
+  font-size: 1em;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin: 0.7em 0 0.2em;
+}
+.doc-h5, .doc-h6 {
+  font-size: 1em;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  margin: 0.6em 0 0.15em;
+}
+.doc-preview > :first-child {
+  margin-top: 0;
+}
+
+/* 단락 */
+.doc-paragraph {
+  margin: 0.5em 0;
+  text-align: justify;
+  letter-spacing: 0.02em;
+}
+
+/* 불릿 문자 기반 위계 (HWPX/DOCX 원본 불릿 보존 케이스) */
+/* Level 1 (상위): ■ □ ▣ ▢ ◆ ◇ — 섹션 헤더급, primary 두껍고 위 여백 큼 */
+.doc-bullet-1 {
+  font-size: 1.1em;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-top: 1.2em;
+  margin-bottom: 0.4em;
+  padding-left: 0;
+  letter-spacing: 0;
+  line-height: 1.5;
+}
+/* Level 2 (중간): ● ○ ◉ ◎ ▸ ▹ — 기본 크기, secondary */
+.doc-bullet-2 {
+  font-size: 0.95em;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-top: 0.45em;
+  margin-bottom: 0.2em;
+  padding-left: 1em;
+  line-height: 1.6;
+}
+/* Level 3 (하위): - * · • ◦ — 작고 흐리게, 더 깊은 들여쓰기 */
+.doc-bullet-3 {
+  font-size: 0.88em;
+  font-weight: 400;
+  color: var(--color-text-muted);
+  margin-top: 0.25em;
+  margin-bottom: 0.15em;
+  padding-left: 2em;
+  line-height: 1.55;
+}
+
+/* kordoc이 HWPX 모든 텍스트를 **bold**로 내보내는 케이스 방어 —
+   불릿 컨텍스트 안의 strong/em은 부모 weight/color를 상속 */
+.doc-bullet-1 .doc-strong,
+.doc-bullet-2 .doc-strong,
+.doc-bullet-3 .doc-strong {
+  font-weight: inherit;
+  color: inherit;
+}
+
+/* 테이블 */
+.doc-table-wrapper {
+  overflow-x: auto;
+  margin: 1em 0;
+  border-radius: 6px;
+  border: 1px solid var(--color-border);
+}
+.doc-table {
+  /* width:100% 제거 — 내용 기반 auto 폭, wrapper 가 좁으면 가로 스크롤.
+     좁은 창에서 한글이 글자 단위로 세로 분해되는 현상 방지 */
+  width: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+  line-height: 1.5;
+  table-layout: auto;
+}
+.doc-thead {
+  background-color: var(--color-bg-tertiary);
+}
+.doc-th {
+  padding: 8px 10px;
+  font-weight: 600;
+  text-align: left;
+  color: var(--color-text-primary);
+  /* 전체 격자 테두리 — HWP 표(결재 도장란·문서번호표 등 병합셀 격자)를 격자로 읽히게 */
+  border: 1px solid var(--color-border);
+  background-color: color-mix(in srgb, var(--color-bg-tertiary) 60%, transparent);
+  /* nowrap 제거 — 헤더도 필요시 줄바꿈, 대신 한글은 단어 경계 유지 */
+  white-space: normal;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+.doc-td {
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  vertical-align: top;
+  /* 한국어 단어 경계 유지 + 긴 토큰은 break */
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+.doc-table tr:hover .doc-td {
+  background-color: color-mix(in srgb, var(--color-accent) 4%, transparent);
+}
+/* 셀 안 중첩 표(결재 헤더 등)는 래퍼의 여백·테두리·스크롤을 제거해 셀 격자에 밀착시킨다 */
+.doc-td .doc-table-wrapper,
+.doc-th .doc-table-wrapper {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+}
+
+/* 리스트 */
+.doc-ul {
+  list-style: disc;
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+.doc-ol {
+  list-style: decimal;
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+.doc-li {
+  margin: 0.2em 0;
+}
+.doc-li::marker {
+  color: var(--color-text-muted);
+}
+
+/* 구분선 */
+.doc-hr {
+  border: none;
+  border-top: 1px dashed var(--color-border);
+  margin: 1.5em 0;
+}
+
+/* 인용문 */
+.doc-blockquote {
+  border-left: 3px solid var(--color-accent);
+  padding: 0.5em 1em;
+  margin: 0.8em 0;
+  background-color: color-mix(in srgb, var(--color-accent) 5%, var(--color-bg-primary));
+  border-radius: 0 4px 4px 0;
+  color: var(--color-text-secondary);
+}
+
+/* 강조 */
+.doc-strong {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.doc-em {
+  font-style: italic;
+}
+/* 취소선 — 원본 문서의 삭제/수정 이력 가독성 유지 */
+.doc-del {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--color-text-muted) 70%, transparent);
+  text-decoration-thickness: 1.5px;
+  text-decoration-skip-ink: none;
+  color: var(--color-text-muted);
+  font-weight: 400;
+  opacity: 0.75;
+}
+/* 취소선 내부의 strong은 두꺼움 상속 해제 (kordoc가 전체를 bold로 감싸는 케이스) */
+.doc-del .doc-strong {
+  font-weight: 400;
+  color: inherit;
+}
+
+/* 요약 내 마크다운 — 컴팩트 여백 */
+.summary-inline .doc-paragraph {
+  margin: 0.2em 0;
+}
+.summary-inline .doc-table-wrapper {
+  margin: 0.4em 0;
+}
+.summary-inline .doc-h1,
+.summary-inline .doc-h2,
+.summary-inline .doc-h3,
+.summary-inline .doc-h4 {
+  font-size: 1em;
+  margin: 0.3em 0 0.1em;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+.summary-inline .doc-ul,
+.summary-inline .doc-ol {
+  margin: 0.2em 0;
+}
+.summary-inline > :first-child {
+  margin-top: 0;
+}
+
+/* ── AI 답변 마크다운 스타일 ── */
+.ai-answer-prose p {
+  margin: 0.4em 0;
+}
+.ai-answer-prose p:first-child {
+  margin-top: 0;
+}
+.ai-answer-prose h2,
+.ai-answer-prose h3 {
+  font-weight: 600;
+  margin: 0.8em 0 0.3em;
+  color: var(--color-text-primary);
+}
+.ai-answer-prose h2 { font-size: 14px; }
+.ai-answer-prose h3 { font-size: 13px; }
+.ai-answer-prose ul,
+.ai-answer-prose ol {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+}
+.ai-answer-prose li {
+  margin: 0.15em 0;
+}
+.ai-answer-prose strong {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.ai-answer-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 12px;
+}
+.ai-answer-prose th,
+.ai-answer-prose td {
+  padding: 4px 8px;
+  border: 1px solid var(--color-border);
+  text-align: left;
+}
+.ai-answer-prose th {
+  background: var(--color-bg-tertiary);
+  font-weight: 600;
+}
+.ai-answer-prose code {
+  font-size: 0.9em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--color-bg-tertiary);
+}
+.ai-answer-prose blockquote {
+  margin: 0.4em 0;
+  padding: 0.3em 0.8em;
+  border-left: 3px solid var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+/* ─── 원본 레이아웃 뷰어 (LayoutView) — SVG 반응형 크기 + 찾기 매치 강조 ───
+   반드시 번들 CSS 에 있어야 한다: 패키징 앱의 CSP 는 Tauri 가 index.html <style> 에
+   nonce 를 주입하면서 style-src 의 'unsafe-inline' 이 무효화되어(CSP3), JS 가 런타임에
+   삽입하는 <style> 태그를 차단한다. 컴포넌트 JSX <style> 로 두면 dev/하니스에선 돌고
+   패키징 앱에서만 svg 가 고유 크기(pt)로 굳어 줌·맞춤이 전혀 안 듣는다. */
+.layout-svg-host svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.layout-svg-host text[data-find] {
+  fill: #b45309;
+}
+.layout-svg-host text[data-find="active"] {
+  fill: #dc2626;
+  font-weight: 700;
+}
